@@ -65,67 +65,15 @@ begin
   end if;
 end $$;
 
--- Migracao do catalogo armazenado no JSONB. Mantem todos os produtos existentes:
--- Cozinha, Espetinhos e a antiga categoria Adicionais passam a Lanche.
--- Produtos que eram Adicionais passam para Lanche / Adicionais; os demais, Lanche / Lanches.
-update public.restobar_state as state
-set
-  payload = jsonb_set(
-    state.payload,
-    '{products}',
-    coalesce(
-      (
-        select jsonb_agg(
-          jsonb_set(
-            jsonb_set(
-              jsonb_set(product, '{category}', to_jsonb(mapped.category), true),
-              '{subcategory}', to_jsonb(mapped.subcategory), true
-            ),
-            '{requiresKitchen}',
-            to_jsonb(case when mapped.category in ('Lanche', 'Entradas') then true else coalesce((product->>'requiresKitchen')::boolean, false) end),
-            true
-          )
-        )
-        from jsonb_array_elements(coalesce(state.payload->'products', '[]'::jsonb)) as product
-        cross join lateral (
-          select case lower(btrim(coalesce(product->>'category', '')))
-            when 'bar' then 'Bebidas'
-            when 'bebida' then 'Bebidas'
-            when 'bebidas' then 'Bebidas'
-            when 'dose' then 'Bebidas'
-            when 'doses' then 'Bebidas'
-            when 'dose/copo' then 'Bebidas'
-            when 'doses/copo' then 'Bebidas'
-            when 'copo' then 'Bebidas'
-            when 'espetinho' then 'Lanche'
-            when 'espetinhos' then 'Lanche'
-            when 'avulso' then 'Lanche'
-            when 'avulsos' then 'Lanche'
-            when 'variedades' then 'Lanche'
-            when 'variados' then 'Lanche'
-            when 'adicional' then 'Lanche'
-            when 'adicionais' then 'Lanche'
-            when 'entrada' then 'Entradas'
-            when 'entradas' then 'Entradas'
-            when 'cozinha' then 'Lanche'
-            when 'lanche' then 'Lanche'
-            when 'lanches' then 'Lanche'
-            when 'oferta' then 'Ofertas'
-            when 'ofertas' then 'Ofertas'
-            else 'Lanche'
-          end as category,
-          case
-            when lower(btrim(coalesce(product->>'category', ''))) in ('adicional', 'adicionais', 'avulso', 'avulsos', 'variedades', 'variados')
-              or product->>'subcategory' = 'Adicionais' then 'Adicionais'
-            when lower(btrim(coalesce(product->>'category', ''))) in ('cozinha', 'lanche', 'lanches', 'espetinho', 'espetinhos') then 'Lanches'
-            when lower(btrim(coalesce(product->>'category', ''))) in ('bar', 'bebida', 'bebidas', 'dose', 'doses', 'dose/copo', 'doses/copo', 'copo') then 'Geral'
-            else ''
-          end as subcategory
-        ) as mapped
-      ),
-      '[]'::jsonb
-    ),
-    true
-  ),
-  updated_at = now()
-where state.id = 'main' and jsonb_typeof(state.payload->'products') = 'array';
+-- Habilita Realtime replication para a tabela restobar_state
+do $$
+begin
+  if not exists (
+    select 1 from pg_publication_tables
+    where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = 'restobar_state'
+  ) then
+    alter publication supabase_realtime add table public.restobar_state;
+  end if;
+end $$;
+
+alter table public.restobar_state replica identity full;

@@ -323,9 +323,11 @@ function money(value) {
 }
 
 const PAYMENT_METHODS = [
-    { value: "pix", label: "Pix" },
-    { value: "cartao", label: "Cartao" },
     { value: "dinheiro", label: "Dinheiro" },
+    { value: "maquineta_debito", label: "Maquineta/Debito" },
+    { value: "maquineta_credito", label: "Maquineta/Credito" },
+    { value: "cartao", label: "Cartao" },
+    { value: "pix", label: "Pix" },
     { value: "fiado", label: "Fiado" }
 ];
 
@@ -802,6 +804,32 @@ section("parseFinalizePaymentRows / paymentSplitsText");
         10
     );
     assertDeepEqual(positiveTotalOk.value, [{ method: "pix", amount: 10 }], "total positivo com valor correto continua valido");
+
+    const multiSplitOk = parseFinalizePaymentRows(
+        [
+            { method: "dinheiro", amountRaw: "35.50", rowName: "pagamento 1" },
+            { method: "maquineta_credito", amountRaw: "64.50", rowName: "pagamento 2" }
+        ],
+        100
+    );
+    assertDeepEqual(multiSplitOk.value, [
+        { method: "dinheiro", amount: 35.5 },
+        { method: "maquineta_credito", amount: 64.5 }
+    ], "pagamento dividido entre dinheiro e cartao aceito com sucesso");
+    assertEqual(
+        paymentSplitsText(multiSplitOk.value, { includeAmount: true }),
+        `Dinheiro ${money(35.5)} + Maquineta/Credito ${money(64.5)}`,
+        "texto formatado para multiplos pagamentos correto"
+    );
+
+    const multiSplitMismatch = parseFinalizePaymentRows(
+        [
+            { method: "dinheiro", amountRaw: "30", rowName: "pagamento 1" },
+            { method: "pix", amountRaw: "50", rowName: "pagamento 2" }
+        ],
+        100
+    );
+    assert(multiSplitMismatch.error && multiSplitMismatch.error.includes("precisa ser igual ao total"), "detecta soma divergente do total");
 }
 
 section("hasSystemTestMarker");

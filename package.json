@@ -1,5 +1,5 @@
 {
-  "name": "saascesas",
+  "name": "brendon-2.0",
   "version": "1.0.0",
   "private": true,
   "description": "Sistema de controle para restaurante/bar (PWA)",
@@ -7,6 +7,10 @@
     "dev": "node scripts/dev-server.js",
     "build": "node scripts/build-static.js",
     "test:stability": "node scripts/test-stability.js",
-    "seed:test-comandas": "node scripts/create-test-comandas.js"
+    "seed:test-comandas": "node scripts/create-test-comandas.js",
+    "seed:products": "node scripts/seed-products.js"
+  },
+  "dependencies": {
+    "wrangler": "^4.136.1"
   }
 }

@@ -23,11 +23,12 @@
   const EDUARDO_RECOVERY_MARKER_KEY = "eduardo_restore_applied_v1";
   const ACCESS_CODE_WAITER_PREFIX = "Garcom Codigo";
   const SYSTEM_TEST_MARKERS = Object.freeze(["teste", "test", "mock", "pixteste", "cupom de teste"]);
-  const ESTABLISHMENT_NAME = "POPEYE HAMBURGUERIA ARTESANAL";
-  const CATEGORIES = ["Bebidas", "Lanche", "Entradas", "Ofertas"];
+  const ESTABLISHMENT_NAME = "Brancao";
+  const CATEGORIES = ["Bar", "Dose/Copo", "Cozinha", "Espetinhos", "Avulso", "Ofertas"];
+  const BAR_SUBCATEGORIES = ["Geral"];
   const BEVERAGE_SUBCATEGORIES = ["Geral"];
   const SNACK_SUBCATEGORIES = ["Lanches", "Adicionais"];
-  const KITCHEN_CATEGORIES = new Set(["Lanche", "Entradas"]);
+  const KITCHEN_CATEGORIES = new Set(["Cozinha"]);
   const KITCHEN_STATUSES = [
     { value: "fila", label: "Fila de espera" },
     { value: "cozinhando", label: "Cozinhando" },
@@ -56,11 +57,11 @@
     "Sem ocorrencia"
   ];
   // Configure these four values with the credentials of Cliente 2 before publishing.
-  const SUPABASE_URL = "https://fumahtcluzftzosadulx.supabase.co";
+  const SUPABASE_URL = "https://wgresekhrdwlxlmftuvs.supabase.co";
   const SUPABASE_ANON_KEY =
-    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZ1bWFodGNsdXpmdHpvc2FkdWx4Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQ1NDQxMDMsImV4cCI6MjEwMDEyMDEwM30.H_LyxgAc6JwkiqCuN2bsXHpANkalyM5CWj1Iv2GLRcI";
-  const SUPABASE_PUBLISHABLE_KEY = "sb_publishable_nUNetGGU0j9KmiPq8XOxdg_Z0RH0xo7";
-  const SUPABASE_PROJECT_ID = "fumahtcluzftzosadulx";
+    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6IndncmVzZWtocmR3bHhsbWZ0dXZzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTAwMjY1NzEsImV4cCI6MjEwNTYwMjU3MX0.NHqDFKe0nH6UjzcTtGZFBNEe_U55EUTkTcs_LQH_yGM";
+  const SUPABASE_PUBLISHABLE_KEY = "sb_publishable_JyK0dnU4FajLisbaxZ7Y_w_ovbBnWv2";
+  const SUPABASE_PROJECT_ID = "wgresekhrdwlxlmftuvs";
   const DEV_ACCESS_LOGIN = "dev";
   const DEV_ACCESS_PASSWORD = "dev";
   const DEV_SESSION_ID = "__dev__";
@@ -166,6 +167,13 @@
   }
 
   const clientSessionId = buildClientSessionId();
+  const LOCAL_BROADCAST_CHANNEL_NAME = "restobar_local_sync";
+  let localBroadcastChannel = null;
+  try {
+    if (typeof window !== "undefined" && "BroadcastChannel" in window) {
+      localBroadcastChannel = new BroadcastChannel(LOCAL_BROADCAST_CHANNEL_NAME);
+    }
+  } catch (_e) { }
 
   function isoNow() {
     return new Date().toISOString();
@@ -381,6 +389,18 @@
       return candidate;
     }
     return "";
+  }
+
+  function generateUniqueItemId(targetState) {
+    targetState = targetState || state;
+    targetState.seq = targetState.seq || {};
+    const seq = Number(targetState.seq.item || 1);
+    targetState.seq.item = seq + 1;
+    const sessionChunkRaw = String(clientSessionId || "").replace(/[^a-z0-9]/gi, "");
+    const sessionChunk = (sessionChunkRaw.slice(-4) || "SESS").toUpperCase();
+    const timeChunk = Date.now().toString(36).slice(-4).toUpperCase();
+    const randomChunk = Math.random().toString(36).slice(2, 4).toUpperCase();
+    return `IT-${String(seq).padStart(5, "0")}-${sessionChunk}${timeChunk}${randomChunk}`;
   }
 
   function browserNameFromUa(uaRaw) {
@@ -779,7 +799,7 @@
       if (previous && comanda && merged) {
         const prevItems = Array.isArray(previous.items) ? previous.items : [];
         const remoteItems = Array.isArray(comanda.items) ? comanda.items : [];
-        if (prevItems.length > 0 && remoteItems.length > 0) {
+        if (prevItems.length > 0 || remoteItems.length > 0) {
           const itemMap = new Map();
           for (const item of prevItems) { if (item?.id) itemMap.set(String(item.id), item); }
           for (const item of remoteItems) {
@@ -1150,12 +1170,1126 @@
     state.meta[metaKey] = current.slice(-800);
   }
 
+  const DEFAULT_INITIAL_PRODUCTS = Object.freeze([
+  {
+    "id": 2,
+    "cost": 3,
+    "name": "Refrigerante lata",
+    "price": 6,
+    "stock": 40,
+    "category": "Bar",
+    "prepTime": 0,
+    "available": true,
+    "subcategory": "Geral",
+    "requiresKitchen": false
+  },
+  {
+    "id": 3,
+    "cost": 3.5,
+    "name": "Suco natural",
+    "price": 8,
+    "stock": 34,
+    "category": "Bar",
+    "prepTime": 0,
+    "available": true,
+    "subcategory": "Geral",
+    "requiresKitchen": false
+  },
+  {
+    "id": 4,
+    "cost": 6.5,
+    "name": "Whisky dose",
+    "price": 14,
+    "stock": 28,
+    "category": "Avulso",
+    "prepTime": 0,
+    "available": true,
+    "subcategory": "",
+    "requiresKitchen": false
+  },
+  {
+    "id": 5,
+    "cost": 5.2,
+    "name": "Vodka dose",
+    "price": 12,
+    "stock": 28,
+    "category": "Avulso",
+    "prepTime": 0,
+    "available": true,
+    "subcategory": "",
+    "requiresKitchen": false
+  },
+  {
+    "id": 8,
+    "cost": 13,
+    "name": "Frango acebolado",
+    "price": 32,
+    "stock": 9,
+    "category": "Cozinha",
+    "prepTime": 20,
+    "available": true,
+    "subcategory": "",
+    "requiresKitchen": true
+  },
+  {
+    "id": 9,
+    "cost": 0,
+    "name": "Espetinho de carne",
+    "price": 6,
+    "stock": 51,
+    "category": "Espetinhos",
+    "prepTime": 0,
+    "available": true,
+    "subcategory": "",
+    "requiresKitchen": false
+  },
+  {
+    "id": 10,
+    "cost": 0,
+    "name": "Espetinho de frango",
+    "price": 6,
+    "stock": 55,
+    "category": "Espetinhos",
+    "prepTime": 0,
+    "available": true,
+    "subcategory": "",
+    "requiresKitchen": false
+  },
+  {
+    "id": 12,
+    "cost": 1.2,
+    "name": "Bala pacote",
+    "price": 3,
+    "stock": 90,
+    "category": "Avulso",
+    "prepTime": 0,
+    "available": true,
+    "subcategory": "",
+    "requiresKitchen": false
+  },
+  {
+    "id": 13,
+    "cost": 15,
+    "name": "Combo Almoço",
+    "price": 36,
+    "stock": 18,
+    "category": "Ofertas",
+    "prepTime": 22,
+    "available": true,
+    "subcategory": "",
+    "requiresKitchen": true
+  },
+  {
+    "id": 14,
+    "cost": 13.2,
+    "name": "Combo balde e gelo",
+    "price": 29,
+    "stock": 18,
+    "category": "Ofertas",
+    "prepTime": 0,
+    "available": true,
+    "subcategory": "",
+    "requiresKitchen": false
+  },
+  {
+    "id": 15,
+    "cost": 0,
+    "name": "MEDALHÃO DE GADO",
+    "price": 6,
+    "stock": 99,
+    "category": "Espetinhos",
+    "prepTime": 0,
+    "available": true,
+    "subcategory": "",
+    "requiresKitchen": false
+  },
+  {
+    "id": 16,
+    "cost": 0,
+    "name": "LINGUIÇA",
+    "price": 6,
+    "stock": 99,
+    "category": "Espetinhos",
+    "prepTime": 0,
+    "available": true,
+    "subcategory": "",
+    "requiresKitchen": false
+  },
+  {
+    "id": 17,
+    "cost": 2,
+    "name": "Baião G",
+    "price": 8,
+    "stock": 95,
+    "category": "Cozinha",
+    "prepTime": 2,
+    "available": true,
+    "subcategory": "",
+    "requiresKitchen": true
+  },
+  {
+    "id": 18,
+    "cost": 2,
+    "name": "Baião P",
+    "price": 5,
+    "stock": 93,
+    "category": "Cozinha",
+    "prepTime": 2,
+    "available": true,
+    "subcategory": "",
+    "requiresKitchen": true
+  },
+  {
+    "id": 19,
+    "cost": 5,
+    "name": "Arroz a Piamontese G",
+    "price": 12,
+    "stock": 98,
+    "category": "Cozinha",
+    "prepTime": 10,
+    "available": true,
+    "subcategory": "",
+    "requiresKitchen": true
+  },
+  {
+    "id": 20,
+    "cost": 3,
+    "name": "Arroz a Piamontese P",
+    "price": 6,
+    "stock": 98,
+    "category": "Cozinha",
+    "prepTime": 10,
+    "available": true,
+    "subcategory": "",
+    "requiresKitchen": true
+  },
+  {
+    "id": 21,
+    "cost": 10,
+    "name": "Espaguete de Carne de Sol",
+    "price": 20,
+    "stock": 97,
+    "category": "Cozinha",
+    "prepTime": 10,
+    "available": true,
+    "subcategory": "",
+    "requiresKitchen": true
+  },
+  {
+    "id": 22,
+    "cost": 10,
+    "name": "Espaguete de Camarão",
+    "price": 20,
+    "stock": 96,
+    "category": "Cozinha",
+    "prepTime": 10,
+    "available": true,
+    "subcategory": "",
+    "requiresKitchen": true
+  },
+  {
+    "id": 23,
+    "cost": 8,
+    "name": "Batata Frita",
+    "price": 15,
+    "stock": 99,
+    "category": "Cozinha",
+    "prepTime": 15,
+    "available": true,
+    "subcategory": "",
+    "requiresKitchen": true
+  },
+  {
+    "id": 24,
+    "cost": 5,
+    "name": "Batata Frita 1/2",
+    "price": 10,
+    "stock": 98,
+    "category": "Cozinha",
+    "prepTime": 15,
+    "available": true,
+    "subcategory": "",
+    "requiresKitchen": true
+  },
+  {
+    "id": 25,
+    "cost": 8,
+    "name": "Calabresa Frita",
+    "price": 15,
+    "stock": 99,
+    "category": "Cozinha",
+    "prepTime": 10,
+    "available": true,
+    "subcategory": "",
+    "requiresKitchen": true
+  },
+  {
+    "id": 26,
+    "cost": 5,
+    "name": "Calabresa frita 1/2",
+    "price": 10,
+    "stock": 99,
+    "category": "Cozinha",
+    "prepTime": 10,
+    "available": true,
+    "subcategory": "",
+    "requiresKitchen": true
+  },
+  {
+    "id": 27,
+    "cost": 10,
+    "name": "Batata com Calabresa 1/2",
+    "price": 20,
+    "stock": 99,
+    "category": "Cozinha",
+    "prepTime": 15,
+    "available": true,
+    "subcategory": "",
+    "requiresKitchen": true
+  },
+  {
+    "id": 28,
+    "cost": 15,
+    "name": "Carne de Sol",
+    "price": 35,
+    "stock": 98,
+    "category": "Cozinha",
+    "prepTime": 20,
+    "available": true,
+    "subcategory": "",
+    "requiresKitchen": true
+  },
+  {
+    "id": 29,
+    "cost": 10,
+    "name": "Carne de sol 1/2",
+    "price": 20,
+    "stock": 99,
+    "category": "Cozinha",
+    "prepTime": 20,
+    "available": true,
+    "subcategory": "",
+    "requiresKitchen": true
+  },
+  {
+    "id": 30,
+    "cost": 20,
+    "name": "Camarão no Alho e Óleo",
+    "price": 40,
+    "stock": 99,
+    "category": "Cozinha",
+    "prepTime": 15,
+    "available": true,
+    "subcategory": "",
+    "requiresKitchen": true
+  },
+  {
+    "id": 31,
+    "cost": 10,
+    "name": "Camarão no Alho e Óleo 1/2",
+    "price": 20,
+    "stock": 99,
+    "category": "Cozinha",
+    "prepTime": 15,
+    "available": true,
+    "subcategory": "",
+    "requiresKitchen": true
+  },
+  {
+    "id": 32,
+    "cost": 5,
+    "name": "Bolinha de Carne",
+    "price": 10,
+    "stock": 99,
+    "category": "Cozinha",
+    "prepTime": 10,
+    "available": true,
+    "subcategory": "",
+    "requiresKitchen": true
+  },
+  {
+    "id": 33,
+    "cost": 5,
+    "name": "Bolinha de Queijo",
+    "price": 10,
+    "stock": 99,
+    "category": "Cozinha",
+    "prepTime": 10,
+    "available": true,
+    "subcategory": "",
+    "requiresKitchen": true
+  },
+  {
+    "id": 34,
+    "cost": 5,
+    "name": "Bolinha de Frango",
+    "price": 10,
+    "stock": 99,
+    "category": "Cozinha",
+    "prepTime": 10,
+    "available": true,
+    "subcategory": "",
+    "requiresKitchen": true
+  },
+  {
+    "id": 35,
+    "cost": 5,
+    "name": "Macaxeira Frita",
+    "price": 15,
+    "stock": 99,
+    "category": "Cozinha",
+    "prepTime": 10,
+    "available": true,
+    "subcategory": "",
+    "requiresKitchen": true
+  },
+  {
+    "id": 36,
+    "cost": 5,
+    "name": "Macaxeira Frita 1/2",
+    "price": 10,
+    "stock": 99,
+    "category": "Cozinha",
+    "prepTime": 10,
+    "available": true,
+    "subcategory": "",
+    "requiresKitchen": true
+  },
+  {
+    "id": 37,
+    "cost": 6,
+    "name": "Feijão Tropeiro G",
+    "price": 15,
+    "stock": 98,
+    "category": "Cozinha",
+    "prepTime": 5,
+    "available": true,
+    "subcategory": "",
+    "requiresKitchen": true
+  },
+  {
+    "id": 38,
+    "cost": 3,
+    "name": "Feijão Tropeiro P",
+    "price": 8,
+    "stock": 99,
+    "category": "Cozinha",
+    "prepTime": 5,
+    "available": true,
+    "subcategory": "",
+    "requiresKitchen": true
+  },
+  {
+    "id": 39,
+    "cost": 2.73,
+    "name": "BRAHMA",
+    "price": 5,
+    "stock": 293,
+    "category": "Bar",
+    "prepTime": 1,
+    "available": true,
+    "subcategory": "Geral",
+    "requiresKitchen": false
+  },
+  {
+    "id": 40,
+    "cost": 2.7,
+    "name": "SKOL",
+    "price": 5,
+    "stock": 50,
+    "category": "Bar",
+    "prepTime": 1,
+    "available": true,
+    "subcategory": "Geral",
+    "requiresKitchen": false
+  },
+  {
+    "id": 41,
+    "cost": 6.25,
+    "name": "HEINEKEN",
+    "price": 9,
+    "stock": 50,
+    "category": "Bar",
+    "prepTime": 1,
+    "available": true,
+    "subcategory": "Geral",
+    "requiresKitchen": false
+  },
+  {
+    "id": 42,
+    "cost": 5.5,
+    "name": "SPARTEN",
+    "price": 8,
+    "stock": 27,
+    "category": "Bar",
+    "prepTime": 1,
+    "available": true,
+    "subcategory": "Geral",
+    "requiresKitchen": false
+  },
+  {
+    "id": 43,
+    "cost": 6.5,
+    "name": "CORONA",
+    "price": 10,
+    "stock": 25,
+    "category": "Bar",
+    "prepTime": 1,
+    "available": true,
+    "subcategory": "Geral",
+    "requiresKitchen": false
+  },
+  {
+    "id": 44,
+    "cost": 2.5,
+    "name": "BLACK WHITE/DOSE",
+    "price": 7,
+    "stock": 2,
+    "category": "Bar",
+    "prepTime": 1,
+    "available": true,
+    "subcategory": "Geral",
+    "requiresKitchen": false
+  },
+  {
+    "id": 45,
+    "cost": 45,
+    "name": "BLACK WHITE/LITRO",
+    "price": 70,
+    "stock": 4,
+    "category": "Bar",
+    "prepTime": 1,
+    "available": true,
+    "subcategory": "Geral",
+    "requiresKitchen": false
+  },
+  {
+    "id": 46,
+    "cost": 1,
+    "name": "DREHER/DOSE",
+    "price": 2,
+    "stock": 10,
+    "category": "Bar",
+    "prepTime": 1,
+    "available": true,
+    "subcategory": "Geral",
+    "requiresKitchen": false
+  },
+  {
+    "id": 47,
+    "cost": 20,
+    "name": "DREHER/LITRO",
+    "price": 35,
+    "stock": 5,
+    "category": "Bar",
+    "prepTime": 1,
+    "available": true,
+    "subcategory": "Geral",
+    "requiresKitchen": false
+  },
+  {
+    "id": 48,
+    "cost": 16,
+    "name": "51/DOSE",
+    "price": 2,
+    "stock": 5,
+    "category": "Bar",
+    "prepTime": 1,
+    "available": true,
+    "subcategory": "Geral",
+    "requiresKitchen": false
+  },
+  {
+    "id": 49,
+    "cost": 18,
+    "name": "51/LITRO",
+    "price": 30,
+    "stock": 5,
+    "category": "Bar",
+    "prepTime": 1,
+    "available": true,
+    "subcategory": "Geral",
+    "requiresKitchen": false
+  },
+  {
+    "id": 50,
+    "cost": 1,
+    "name": "YPIOCA/ AMARELA",
+    "price": 3,
+    "stock": 9994,
+    "category": "Bar",
+    "prepTime": 1,
+    "available": true,
+    "subcategory": "Geral",
+    "requiresKitchen": false
+  },
+  {
+    "id": 51,
+    "cost": 1,
+    "name": "YPIOCA/ BRANCA",
+    "price": 2,
+    "stock": 7,
+    "category": "Bar",
+    "prepTime": 1,
+    "available": true,
+    "subcategory": "Geral",
+    "requiresKitchen": false
+  },
+  {
+    "id": 52,
+    "cost": 2,
+    "name": "YPIOCA/ EMPALHADA",
+    "price": 4,
+    "stock": 7,
+    "category": "Bar",
+    "prepTime": 1,
+    "available": true,
+    "subcategory": "Geral",
+    "requiresKitchen": false
+  },
+  {
+    "id": 53,
+    "cost": 4,
+    "name": "YPIOCA/ 150 ANOS",
+    "price": 8,
+    "stock": 2,
+    "category": "Bar",
+    "prepTime": 1,
+    "available": true,
+    "subcategory": "Geral",
+    "requiresKitchen": false
+  },
+  {
+    "id": 54,
+    "cost": 4,
+    "name": "CAMPARI/ DOSE",
+    "price": 7,
+    "stock": 5,
+    "category": "Bar",
+    "prepTime": 1,
+    "available": true,
+    "subcategory": "Geral",
+    "requiresKitchen": false
+  },
+  {
+    "id": 55,
+    "cost": 60,
+    "name": "CAMPARI/ LITRO",
+    "price": 80,
+    "stock": 4,
+    "category": "Bar",
+    "prepTime": 1,
+    "available": true,
+    "subcategory": "Geral",
+    "requiresKitchen": false
+  },
+  {
+    "id": 56,
+    "cost": 3,
+    "name": "TEACHER'S / DOSE",
+    "price": 5,
+    "stock": 5,
+    "category": "Bar",
+    "prepTime": 1,
+    "available": true,
+    "subcategory": "Geral",
+    "requiresKitchen": false
+  },
+  {
+    "id": 57,
+    "cost": 40,
+    "name": "TEACHER'S / LITRO",
+    "price": 60,
+    "stock": 4,
+    "category": "Bar",
+    "prepTime": 1,
+    "available": true,
+    "subcategory": "Geral",
+    "requiresKitchen": false
+  },
+  {
+    "id": 58,
+    "cost": 5,
+    "name": "RED LABEL / DOSE",
+    "price": 10,
+    "stock": 2,
+    "category": "Bar",
+    "prepTime": 1,
+    "available": true,
+    "subcategory": "Geral",
+    "requiresKitchen": false
+  },
+  {
+    "id": 59,
+    "cost": 90,
+    "name": "RED LABEL / LITRO",
+    "price": 130,
+    "stock": 2,
+    "category": "Bar",
+    "prepTime": 1,
+    "available": true,
+    "subcategory": "Geral",
+    "requiresKitchen": false
+  },
+  {
+    "id": 60,
+    "cost": 10,
+    "name": "OLD PAR / DOSE",
+    "price": 15,
+    "stock": 1,
+    "category": "Bar",
+    "prepTime": 1,
+    "available": true,
+    "subcategory": "Geral",
+    "requiresKitchen": false
+  },
+  {
+    "id": 61,
+    "cost": 140,
+    "name": "OLD PAR / LITRO",
+    "price": 190,
+    "stock": 2,
+    "category": "Bar",
+    "prepTime": 1,
+    "available": true,
+    "subcategory": "Geral",
+    "requiresKitchen": false
+  },
+  {
+    "id": 62,
+    "cost": 2,
+    "name": "MONTILA",
+    "price": 4,
+    "stock": 5,
+    "category": "Bar",
+    "prepTime": 1,
+    "available": true,
+    "subcategory": "Geral",
+    "requiresKitchen": false
+  },
+  {
+    "id": 63,
+    "cost": 1,
+    "name": "VODKA SLOVA / DOSE",
+    "price": 2,
+    "stock": 4,
+    "category": "Bar",
+    "prepTime": 1,
+    "available": true,
+    "subcategory": "Geral",
+    "requiresKitchen": false
+  },
+  {
+    "id": 64,
+    "cost": 12,
+    "name": "VODKA SLOVA / LITRO",
+    "price": 20,
+    "stock": 5,
+    "category": "Bar",
+    "prepTime": 1,
+    "available": true,
+    "subcategory": "Geral",
+    "requiresKitchen": false
+  },
+  {
+    "id": 65,
+    "cost": 2,
+    "name": "FOGO PAULISTA / DOSE",
+    "price": 3,
+    "stock": 2,
+    "category": "Bar",
+    "prepTime": 1,
+    "available": true,
+    "subcategory": "Geral",
+    "requiresKitchen": false
+  },
+  {
+    "id": 66,
+    "cost": 1,
+    "name": "PRESIDENTE / DOSE",
+    "price": 2,
+    "stock": 2,
+    "category": "Bar",
+    "prepTime": 1,
+    "available": true,
+    "subcategory": "Geral",
+    "requiresKitchen": false
+  },
+  {
+    "id": 67,
+    "cost": 2,
+    "name": "VELHO BARREIRO / DOSE",
+    "price": 3,
+    "stock": 1,
+    "category": "Bar",
+    "prepTime": 1,
+    "available": true,
+    "subcategory": "Geral",
+    "requiresKitchen": false
+  },
+  {
+    "id": 68,
+    "cost": 2,
+    "name": "SÃO JOÃO DA BARRA / DOSE",
+    "price": 3,
+    "stock": 2,
+    "category": "Bar",
+    "prepTime": 1,
+    "available": true,
+    "subcategory": "Geral",
+    "requiresKitchen": false
+  },
+  {
+    "id": 69,
+    "cost": 2,
+    "name": "VODKA ORLOFF / DOSE",
+    "price": 4,
+    "stock": 3,
+    "category": "Bar",
+    "prepTime": 1,
+    "available": true,
+    "subcategory": "Geral",
+    "requiresKitchen": false
+  },
+  {
+    "id": 70,
+    "cost": 40,
+    "name": "VODKA ORLOFF / LITRO",
+    "price": 60,
+    "stock": 3,
+    "category": "Bar",
+    "prepTime": 1,
+    "available": true,
+    "subcategory": "Geral",
+    "requiresKitchen": false
+  },
+  {
+    "id": 71,
+    "cost": 1.8,
+    "name": "REFRIGERANTE PET",
+    "price": 3,
+    "stock": 38,
+    "category": "Bar",
+    "prepTime": 1,
+    "available": true,
+    "subcategory": "Geral",
+    "requiresKitchen": false
+  },
+  {
+    "id": 72,
+    "cost": 2,
+    "name": "REFRIGERANTE LATA",
+    "price": 4,
+    "stock": 27,
+    "category": "Bar",
+    "prepTime": 1,
+    "available": true,
+    "subcategory": "Geral",
+    "requiresKitchen": false
+  },
+  {
+    "id": 73,
+    "cost": 3.49,
+    "name": "REFRIGERANTE LATA",
+    "price": 5,
+    "stock": 20,
+    "category": "Bar",
+    "prepTime": 1,
+    "available": true,
+    "subcategory": "Geral",
+    "requiresKitchen": false
+  },
+  {
+    "id": 74,
+    "cost": 1.5,
+    "name": "ÁGUA C/GÁS",
+    "price": 3,
+    "stock": 24,
+    "category": "Bar",
+    "prepTime": 1,
+    "available": true,
+    "subcategory": "Geral",
+    "requiresKitchen": false
+  },
+  {
+    "id": 75,
+    "cost": 1,
+    "name": "ÁGUA S/GÁS",
+    "price": 2,
+    "stock": 30,
+    "category": "Bar",
+    "prepTime": 1,
+    "available": true,
+    "subcategory": "Geral",
+    "requiresKitchen": false
+  },
+  {
+    "id": 76,
+    "cost": 3,
+    "name": "DELL VALE",
+    "price": 5,
+    "stock": 7,
+    "category": "Bar",
+    "prepTime": 1,
+    "available": true,
+    "subcategory": "Geral",
+    "requiresKitchen": false
+  },
+  {
+    "id": 77,
+    "cost": 5,
+    "name": "COCA 1L",
+    "price": 10,
+    "stock": 15,
+    "category": "Bar",
+    "prepTime": 1,
+    "available": true,
+    "subcategory": "Geral",
+    "requiresKitchen": false
+  },
+  {
+    "id": 78,
+    "cost": 5,
+    "name": "COCA 600ML",
+    "price": 7,
+    "stock": 5,
+    "category": "Bar",
+    "prepTime": 1,
+    "available": true,
+    "subcategory": "Geral",
+    "requiresKitchen": false
+  },
+  {
+    "id": 79,
+    "cost": 5,
+    "name": "REFRIGERANTE 1L",
+    "price": 7,
+    "stock": 12,
+    "category": "Bar",
+    "prepTime": 1,
+    "available": true,
+    "subcategory": "Geral",
+    "requiresKitchen": false
+  },
+  {
+    "id": 80,
+    "cost": 12,
+    "name": "COCA 2L",
+    "price": 15,
+    "stock": 5,
+    "category": "Bar",
+    "prepTime": 1,
+    "available": true,
+    "subcategory": "Geral",
+    "requiresKitchen": false
+  },
+  {
+    "id": 81,
+    "cost": 7,
+    "name": "REFRIGERANTE 2L",
+    "price": 12,
+    "stock": 12,
+    "category": "Bar",
+    "prepTime": 1,
+    "available": true,
+    "subcategory": "Geral",
+    "requiresKitchen": false
+  },
+  {
+    "id": 82,
+    "cost": 9,
+    "name": "RED BULL",
+    "price": 12,
+    "stock": 6,
+    "category": "Bar",
+    "prepTime": 1,
+    "available": true,
+    "subcategory": "Geral",
+    "requiresKitchen": false
+  },
+  {
+    "id": 83,
+    "cost": 9,
+    "name": "MONSTER",
+    "price": 12,
+    "stock": 12,
+    "category": "Bar",
+    "prepTime": 1,
+    "available": true,
+    "subcategory": "Geral",
+    "requiresKitchen": false
+  },
+  {
+    "id": 84,
+    "cost": 6,
+    "name": "ICE CABARÉ",
+    "price": 10,
+    "stock": 12,
+    "category": "Bar",
+    "prepTime": 1,
+    "available": true,
+    "subcategory": "Geral",
+    "requiresKitchen": false
+  },
+  {
+    "id": 85,
+    "cost": 3.14,
+    "name": "CHOKITO",
+    "price": 4,
+    "stock": 20,
+    "category": "Avulso",
+    "prepTime": 1,
+    "available": true,
+    "subcategory": "",
+    "requiresKitchen": false
+  },
+  {
+    "id": 86,
+    "cost": 3.14,
+    "name": "PRESTÍGIO",
+    "price": 4,
+    "stock": 20,
+    "category": "Avulso",
+    "prepTime": 1,
+    "available": true,
+    "subcategory": "",
+    "requiresKitchen": false
+  },
+  {
+    "id": 87,
+    "cost": 1.4,
+    "name": "BATOM GAROTO",
+    "price": 2.5,
+    "stock": 50,
+    "category": "Avulso",
+    "prepTime": 1,
+    "available": true,
+    "subcategory": "",
+    "requiresKitchen": false
+  },
+  {
+    "id": 89,
+    "cost": 3.14,
+    "name": "CARIBE",
+    "price": 4,
+    "stock": 15,
+    "category": "Avulso",
+    "prepTime": 1,
+    "available": true,
+    "subcategory": "",
+    "requiresKitchen": false
+  },
+  {
+    "id": 91,
+    "cost": 0.2,
+    "name": "PIRULITO",
+    "price": 0.5,
+    "stock": 50,
+    "category": "Avulso",
+    "prepTime": 1,
+    "available": true,
+    "subcategory": "",
+    "requiresKitchen": false
+  },
+  {
+    "id": 92,
+    "cost": 1,
+    "name": "FINI",
+    "price": 2,
+    "stock": 20,
+    "category": "Avulso",
+    "prepTime": 1,
+    "available": true,
+    "subcategory": "",
+    "requiresKitchen": false
+  },
+  {
+    "id": 93,
+    "cost": 1,
+    "name": "SONHO DE VALSA",
+    "price": 2,
+    "stock": 15,
+    "category": "Avulso",
+    "prepTime": 1,
+    "available": true,
+    "subcategory": "",
+    "requiresKitchen": false
+  },
+  {
+    "id": 94,
+    "cost": 2,
+    "name": "TRIDENT",
+    "price": 3,
+    "stock": 20,
+    "category": "Avulso",
+    "prepTime": 1,
+    "available": true,
+    "subcategory": "",
+    "requiresKitchen": false
+  },
+  {
+    "id": 95,
+    "cost": 1.4,
+    "name": "MENTOS",
+    "price": 2,
+    "stock": 29,
+    "category": "Avulso",
+    "prepTime": 1,
+    "available": true,
+    "subcategory": "",
+    "requiresKitchen": false
+  },
+  {
+    "id": 96,
+    "cost": 1.34,
+    "name": "HALLS",
+    "price": 2.5,
+    "stock": 15,
+    "category": "Avulso",
+    "prepTime": 1,
+    "available": true,
+    "subcategory": "",
+    "requiresKitchen": false
+  },
+  {
+    "id": 97,
+    "cost": 1.9,
+    "name": "Coca Pet 250ml",
+    "price": 4,
+    "stock": 85,
+    "category": "Bar",
+    "prepTime": 1,
+    "available": true,
+    "subcategory": "Geral",
+    "requiresKitchen": false
+  },
+  {
+    "id": 98,
+    "cost": 3,
+    "name": "Porco",
+    "price": 6,
+    "stock": 1500,
+    "category": "Espetinhos",
+    "prepTime": 5,
+    "available": true,
+    "subcategory": "",
+    "requiresKitchen": false
+  }
+]);
+
+  const CANONICAL_PRODUCT_BY_ID = Object.freeze(
+    DEFAULT_INITIAL_PRODUCTS.reduce((acc, p) => {
+      acc[p.id] = p;
+      return acc;
+    }, {})
+  );
+
   function initialState() {
     return {
       users: [
         { id: 1, role: "admin", name: "Administrador", functionName: "Administrador", login: "admin", password: "admin", active: true, updatedAt: isoNow() }
       ],
-      products: [],
+      products: DEFAULT_INITIAL_PRODUCTS.map((p) => ({ ...p })),
       openComandas: [],
       closedComandas: [],
       cashHtmlReports: [],
@@ -1173,7 +2307,7 @@
       },
       seq: {
         user: 2,
-        product: 1,
+        product: 99,
         comanda: 1,
         item: 1,
         sale: 1,
@@ -1652,35 +2786,28 @@
 
   function normalizeCategoryName(category) {
     const raw = String(category || "").trim();
-    if (!raw) return "Lanche";
+    if (!raw) return "Avulso";
     const flat = raw
       .normalize("NFD")
       .replace(/[\u0300-\u036f]/g, "")
       .toLowerCase();
-    if (flat === "doses" || flat === "dose" || flat === "doses/copo" || flat === "dose/copo" || flat === "copo") return "Bebidas";
-    if (flat === "bar" || flat === "bebida" || flat === "bebidas") return "Bebidas";
-    if (flat === "cozinha" || flat === "lanche" || flat === "lanches") return "Lanche";
-    if (flat === "espetinho" || flat === "espetinhos" || flat === "espertinho" || flat === "espertinhos") return "Lanche";
-    if (flat === "adicional" || flat === "adicionais" || flat === "avulso" || flat === "avulsos" || flat === "variedades" || flat === "variados") return "Lanche";
-    if (flat === "entrada" || flat === "entradas") return "Entradas";
+    if (flat === "doses" || flat === "dose" || flat === "doses/copo" || flat === "dose/copo" || flat === "copo") return "Dose/Copo";
+    if (flat === "bar" || flat === "bebida" || flat === "bebidas") return "Bar";
+    if (flat === "cozinha" || flat === "lanche" || flat === "lanches") return "Cozinha";
+    if (flat === "espetinho" || flat === "espetinhos" || flat === "espertinho" || flat === "espertinhos") return "Espetinhos";
+    if (flat === "avulso" || flat === "avulsos" || flat === "variedades" || flat === "variados") return "Avulso";
     if (flat === "oferta" || flat === "ofertas") return "Ofertas";
-    return "Lanche";
+    return "Avulso";
   }
 
   function normalizeProductCategory(category) {
     return normalizeCategoryName(category);
   }
 
-  function normalizeProductSubcategory(product, normalizedCategory = product.category) {
-    if (normalizedCategory === "Lanche") {
-      const sourceCategory = String(product.category || "").trim().toLowerCase();
-      const raw = String(product.subcategory || "").trim();
-      if (["adicional", "adicionais", "avulso", "avulsos"].includes(sourceCategory) || raw === "Adicionais") return "Adicionais";
-      return "Lanches";
-    }
-    if (normalizedCategory !== "Bebidas") return "";
+  function normalizeProductSubcategory(product) {
+    if (product.category !== "Bar") return "";
     const raw = String(product.subcategory || "").trim();
-    return BEVERAGE_SUBCATEGORIES.includes(raw) ? raw : "Geral";
+    return BAR_SUBCATEGORIES.includes(raw) ? raw : "Geral";
   }
 
   function normalizeComandaItem(item, fallbackId = 0) {
@@ -1728,22 +2855,29 @@
   }
 
   function normalizeProductRecord(product, fallbackId = 0) {
-    const normalizedCategory = normalizeProductCategory(product.category);
-    const effectiveCategory = normalizedCategory;
+    const id = Number(product.id || fallbackId);
+    const canonical = CANONICAL_PRODUCT_BY_ID[id];
+    const categoryFromInput = String(product.category || "").trim();
+    const effectiveCategory = canonical ? canonical.category : normalizeProductCategory(categoryFromInput);
     const normalized = {
       ...product,
-      id: Number(product.id || fallbackId),
+      id,
       category: effectiveCategory,
-      price: Number(product.price ?? 0),
-      stock: Number(product.stock ?? 0),
-      cost: Number(product.cost ?? 0),
-      prepTime: Number(product.prepTime ?? 0),
-      name: String(product.name || "")
+      price: Number(product.price ?? canonical?.price ?? 0),
+      stock: Number(product.stock ?? canonical?.stock ?? 0),
+      cost: Number(product.cost ?? canonical?.cost ?? 0),
+      prepTime: Number(product.prepTime ?? canonical?.prepTime ?? 0),
+      name: String(product.name || canonical?.name || "")
     };
-    normalized.subcategory = normalizeProductSubcategory(product, effectiveCategory);
+    normalized.subcategory = canonical ? canonical.subcategory : normalizeProductSubcategory(product);
     normalized.available = product.available !== false;
-    normalized.requiresKitchen =
-      KITCHEN_CATEGORIES.has(effectiveCategory) ? true : effectiveCategory === "Ofertas" ? Boolean(product.requiresKitchen) : false;
+    normalized.requiresKitchen = canonical
+      ? Boolean(canonical.requiresKitchen)
+      : KITCHEN_CATEGORIES.has(effectiveCategory)
+        ? true
+        : effectiveCategory === "Ofertas"
+          ? Boolean(product.requiresKitchen)
+          : false;
     normalized.updatedAt = product.updatedAt ? String(product.updatedAt) : isoNow();
     return normalized;
   }
@@ -2122,10 +3256,20 @@
     supabaseCtx.pendingStateChangeBroadcast = null;
   }
 
+  function broadcastRealtimePayload(event, payload) {
+    if (localBroadcastChannel) {
+      try {
+        localBroadcastChannel.postMessage({ event, payload });
+      } catch (_e) { }
+    }
+    if (supabaseCtx.channel) {
+      supabaseCtx.channel.send({ type: "broadcast", event, payload }).catch(() => { });
+    }
+  }
+
   function publishSupabaseStateChange(remoteUpdatedAtValue) {
     const pending = supabaseCtx.pendingStateChangeBroadcast;
     supabaseCtx.pendingStateChangeBroadcast = null;
-    if (!supabaseCtx.channel) return;
     const payload = {
       updatedAt: normalizeIsoTimestamp(remoteUpdatedAtValue) || isoNow(),
       localUpdatedAt: pending?.localUpdatedAt || normalizeIsoTimestamp(state.meta?.updatedAt) || isoNow(),
@@ -2136,7 +3280,7 @@
       sessionId: clientSessionId,
       broadcastAt: isoNow()
     };
-    supabaseCtx.channel.send({ type: "broadcast", event: "state_changed", payload }).catch(() => { });
+    broadcastRealtimePayload("state_changed", payload);
   }
 
   function cloneRealtimePayload(value) {
@@ -2148,9 +3292,8 @@
   }
 
   function publishKitchenOrderUpsert(comanda, items, actor, reason = "Novo pedido") {
-    if (!supabaseCtx.channel || !comanda) return;
+    if (!comanda) return;
     const kitchenItems = (Array.isArray(items) ? items : []).filter((item) => item && itemNeedsKitchen(item));
-    if (!kitchenItems.length) return;
     const payload = {
       sessionId: clientSessionId,
       broadcastAt: isoNow(),
@@ -2162,11 +3305,11 @@
       comanda: cloneRealtimePayload(comanda),
       itemIds: kitchenItems.map((item) => String(item.id || "")).filter(Boolean)
     };
-    supabaseCtx.channel.send({ type: "broadcast", event: "kitchen_order_upsert", payload }).catch(() => { });
+    broadcastRealtimePayload("kitchen_order_upsert", payload);
   }
 
   function publishComandaUpsert(comanda, items, actor, reason = "Comanda atualizada") {
-    if (!supabaseCtx.channel || !comanda) return;
+    if (!comanda) return;
     const payload = {
       sessionId: clientSessionId,
       broadcastAt: isoNow(),
@@ -2178,7 +3321,142 @@
       comanda: cloneRealtimePayload(comanda),
       itemIds: (Array.isArray(items) ? items : []).map((item) => String(item.id || "")).filter(Boolean)
     };
-    supabaseCtx.channel.send({ type: "broadcast", event: "comanda_upsert", payload }).catch(() => { });
+    broadcastRealtimePayload("comanda_upsert", payload);
+  }
+
+  function publishComandaClosed(comanda, actor, reason = "Comanda finalizada") {
+    if (!comanda) return;
+    const payload = {
+      sessionId: clientSessionId,
+      broadcastAt: isoNow(),
+      updatedAt: normalizeIsoTimestamp(state.meta?.updatedAt) || isoNow(),
+      reason,
+      actorId: actor?.id ?? null,
+      actorRole: String(actor?.role || ""),
+      actorName: String(actor?.name || ""),
+      comanda: cloneRealtimePayload(comanda),
+      comandaId: String(comanda?.id || "")
+    };
+    broadcastRealtimePayload("comanda_closed", payload);
+  }
+
+  function publishComandaDeleted(comandaId, actor, reason = "Comanda excluida") {
+    if (!comandaId) return;
+    const payload = {
+      sessionId: clientSessionId,
+      broadcastAt: isoNow(),
+      updatedAt: normalizeIsoTimestamp(state.meta?.updatedAt) || isoNow(),
+      reason,
+      actorId: actor?.id ?? null,
+      actorRole: String(actor?.role || ""),
+      actorName: String(actor?.name || ""),
+      comandaId: String(comandaId || "")
+    };
+    broadcastRealtimePayload("comanda_deleted", payload);
+  }
+
+  function applyComandaClosed(payload) {
+    if (!payload || payload.sessionId === clientSessionId) return false;
+    const incoming = payload.comanda;
+    const comandaId = String(incoming?.id || payload.comandaId || "").trim();
+    if (!comandaId) return false;
+
+    state.openComandas = (Array.isArray(state.openComandas) ? state.openComandas : []).filter(c => String(c?.id || "").trim() !== comandaId);
+    const closedRows = Array.isArray(state.closedComandas) ? state.closedComandas : [];
+    const existingIndex = closedRows.findIndex(c => String(c?.id || "").trim() === comandaId);
+    if (existingIndex >= 0) {
+      closedRows[existingIndex] = { ...closedRows[existingIndex], ...(incoming || {}) };
+    } else if (incoming) {
+      state.closedComandas = [incoming, ...closedRows];
+    }
+    if (uiState.waiterActiveComandaId === comandaId) {
+      uiState.waiterActiveComandaId = null;
+    }
+    delete uiState.finalizeOpenByComanda[comandaId];
+    saveState({ skipCloud: true, touchMeta: false });
+    return true;
+  }
+
+  function applyComandaDeleted(payload) {
+    if (!payload || payload.sessionId === clientSessionId) return false;
+    const comandaId = String(payload.comandaId || "").trim();
+    if (!comandaId) return false;
+
+    trackDeletedEntity("deletedComandaIds", comandaId);
+    state.openComandas = (Array.isArray(state.openComandas) ? state.openComandas : []).filter(c => String(c?.id || "").trim() !== comandaId);
+    state.closedComandas = (Array.isArray(state.closedComandas) ? state.closedComandas : []).filter(c => String(c?.id || "").trim() !== comandaId);
+    if (uiState.waiterActiveComandaId === comandaId) {
+      uiState.waiterActiveComandaId = null;
+    }
+    if (uiState.comandaDetailsId === comandaId) {
+      uiState.comandaDetailsId = null;
+    }
+    delete uiState.finalizeOpenByComanda[comandaId];
+    saveState({ skipCloud: true, touchMeta: false });
+    return true;
+  }
+
+  function handleIncomingRealtimeMessage(event, payload) {
+    if (!payload || payload.sessionId === clientSessionId) return;
+    switch (event) {
+      case "state_changed":
+        rememberObservedRemoteUpdatedAt(payload.updatedAt);
+        void pullStateFromSupabase();
+        break;
+      case "kitchen_order_upsert":
+        if (applyKitchenOrderUpsert(payload)) {
+          render();
+        }
+        rememberObservedRemoteUpdatedAt(payload.updatedAt);
+        debouncedRemotePullFromSupabase();
+        break;
+      case "comanda_upsert":
+        if (applyComandaUpsert(payload)) {
+          render();
+        }
+        rememberObservedRemoteUpdatedAt(payload.updatedAt);
+        debouncedRemotePullFromSupabase();
+        break;
+      case "comanda_closed":
+        if (applyComandaClosed(payload)) {
+          render();
+        }
+        rememberObservedRemoteUpdatedAt(payload.updatedAt);
+        debouncedRemotePullFromSupabase();
+        break;
+      case "comanda_deleted":
+        if (applyComandaDeleted(payload)) {
+          render();
+        }
+        rememberObservedRemoteUpdatedAt(payload.updatedAt);
+        debouncedRemotePullFromSupabase();
+        break;
+      case "presence_ping":
+        upsertDevicePresence(payload);
+        const user = getCurrentUser();
+        if (user?.role === "dev" && uiState.devTab === "devices") {
+          render();
+        }
+        break;
+      case "audit_event":
+        pushRemoteMonitorEvent(payload);
+        const u = getCurrentUser();
+        if (
+          (u?.role === "admin" && (uiState.adminTab === "monitor" || uiState.adminTab === "cozinha" || uiState.adminTab === "dashboard")) ||
+          (u?.role === "dev" && (uiState.devTab === "monitor" || uiState.devTab === "cozinha" || uiState.devTab === "dashboard"))
+        ) {
+          render();
+        }
+        break;
+    }
+  }
+
+  if (localBroadcastChannel) {
+    localBroadcastChannel.onmessage = (e) => {
+      const msg = e.data;
+      if (!msg || !msg.event || !msg.payload) return;
+      handleIncomingRealtimeMessage(msg.event, msg.payload);
+    };
   }
 
   function mergeRealtimeItems(existingItems, incomingItems) {
@@ -2602,7 +3880,9 @@
       const remoteHasMoreData =
         remoteFootprint.catalogRows > localFootprint.catalogRows ||
         remoteFootprint.operationalRows > localFootprint.operationalRows;
-      const shouldPull = (Number.isFinite(remoteUpdated) && remoteUpdated > localUpdated) || (localLooksReset && remoteHasMoreData);
+      const areEquivalent = areCloudStatesEquivalent(state, data.payload);
+      const isKnownSameVersion = Boolean(data.updated_at && data.updated_at === supabaseCtx.lastKnownRemoteUpdatedAt);
+      const shouldPull = !areEquivalent || !isKnownSameVersion || (Number.isFinite(remoteUpdated) && remoteUpdated > localUpdated) || (localLooksReset && remoteHasMoreData);
       console.log("[pullStateFromSupabase] shouldPull:", shouldPull, "remoteUpdated:", remoteUpdated, "localUpdated:", localUpdated);
       if (shouldPull) {
         if (shouldForceRemotePreference(data.payload, state)) {
@@ -2658,10 +3938,9 @@
       if (error || !data?.updated_at) return;
       const observedUpdatedAt = rememberObservedRemoteUpdatedAt(data.updated_at);
       if (!observedUpdatedAt) return;
-      const observedTs = parseUpdatedAtTimestamp(observedUpdatedAt);
-      const knownTs = parseUpdatedAtTimestamp(supabaseCtx.lastKnownRemoteUpdatedAt);
-      const localTs = parseUpdatedAtTimestamp(state.meta?.updatedAt);
-      if (observedTs > Math.max(knownTs, localTs)) {
+      const knownTs = String(supabaseCtx.lastKnownRemoteUpdatedAt || "").trim();
+      const currentObserved = String(observedUpdatedAt || "").trim();
+      if (currentObserved !== knownTs) {
         debouncedRemotePullFromSupabase();
       }
     } catch (_err) { }
@@ -2791,44 +4070,13 @@
 
     const channel = client.channel("restobar-live", { config: { broadcast: { self: false } } });
     channel
-      .on("broadcast", { event: "audit_event" }, (message) => {
-        if (message?.payload) {
-          pushRemoteMonitorEvent(message.payload);
-          const user = getCurrentUser();
-          if (
-            (user?.role === "admin" && (uiState.adminTab === "monitor" || uiState.adminTab === "cozinha" || uiState.adminTab === "dashboard")) ||
-            (user?.role === "dev" && (uiState.devTab === "monitor" || uiState.devTab === "cozinha" || uiState.devTab === "dashboard"))
-          ) {
-            render();
-          }
-        }
-      })
-      .on("broadcast", { event: "presence_ping" }, (message) => {
-        if (!message?.payload) return;
-        upsertDevicePresence(message.payload);
-        const user = getCurrentUser();
-        if (user?.role === "dev" && uiState.devTab === "devices") {
-          render();
-        }
-      })
-      .on("broadcast", { event: "state_changed" }, (message) => {
-        rememberObservedRemoteUpdatedAt(message?.payload?.updatedAt);
-        void pullStateFromSupabase(); // Call immediately, no debounce
-      })
-      .on("broadcast", { event: "kitchen_order_upsert" }, (message) => {
-        if (applyKitchenOrderUpsert(message?.payload)) {
-          render();
-        }
-        rememberObservedRemoteUpdatedAt(message?.payload?.updatedAt);
-        debouncedRemotePullFromSupabase();
-      })
-      .on("broadcast", { event: "comanda_upsert" }, (message) => {
-        if (applyComandaUpsert(message?.payload)) {
-          render();
-        }
-        rememberObservedRemoteUpdatedAt(message?.payload?.updatedAt);
-        debouncedRemotePullFromSupabase();
-      })
+      .on("broadcast", { event: "audit_event" }, (m) => handleIncomingRealtimeMessage("audit_event", m?.payload))
+      .on("broadcast", { event: "presence_ping" }, (m) => handleIncomingRealtimeMessage("presence_ping", m?.payload))
+      .on("broadcast", { event: "state_changed" }, (m) => handleIncomingRealtimeMessage("state_changed", m?.payload))
+      .on("broadcast", { event: "kitchen_order_upsert" }, (m) => handleIncomingRealtimeMessage("kitchen_order_upsert", m?.payload))
+      .on("broadcast", { event: "comanda_upsert" }, (m) => handleIncomingRealtimeMessage("comanda_upsert", m?.payload))
+      .on("broadcast", { event: "comanda_closed" }, (m) => handleIncomingRealtimeMessage("comanda_closed", m?.payload))
+      .on("broadcast", { event: "comanda_deleted" }, (m) => handleIncomingRealtimeMessage("comanda_deleted", m?.payload))
       .on(
         "postgres_changes",
         {
@@ -3062,15 +4310,15 @@
 
   function productNeedsKitchen(product) {
     if (!product) return false;
-    if (KITCHEN_CATEGORIES.has(product.category)) return true;
+    if (product.category === "Cozinha") return true;
     return product.category === "Ofertas" && Boolean(product.requiresKitchen);
   }
 
   function itemNeedsKitchen(item) {
     if (!item) return false;
-    if (item.needsKitchen !== undefined) return Boolean(item.needsKitchen);
-    if (KITCHEN_CATEGORIES.has(item.category)) return true;
-    return item.category === "Ofertas" && Boolean(item.requiresKitchen);
+    if (item.category === "Cozinha") return true;
+    if (item.category === "Ofertas" && Boolean(item.requiresKitchen)) return true;
+    return false;
   }
 
   function isKitchenOrderActive(item) {
@@ -3800,7 +5048,7 @@
         </div>
         <div class="card">
           <h3>Categorias</h3>
-          <p class="note">Classificacao: Bebidas, Lanche (Lanches e Adicionais), Entradas e Ofertas (combos e promocionais).</p>
+          <p class="note">Classificacao: Bar, Dose/Copo, Cozinha, Espetinhos, Avulso e Ofertas (combos e promocionais).</p>
           <div class="actions" style="margin-top:0.75rem;">
             ${CATEGORIES.map((c) => `<span class="tag">${esc(c)}</span>`).join("")}
             <span class="tag">Ofertas / depende da cozinha</span>
@@ -6234,7 +7482,7 @@
       <div class="grid cols-2">
         <div class="card">
           <h3>${title}</h3>
-          <p class="note">Venda rapida. Itens com fluxo de cozinha (Lanche, Entradas e Ofertas dependentes) entram na fila da cozinha com as mesmas regras da comanda.</p>
+          <p class="note">Venda rapida. Itens com fluxo de cozinha (Cozinha e Ofertas dependentes) entram na fila da cozinha com as mesmas regras da comanda.</p>
           <form id="quick-sale-form" data-role="quick-sale-form" data-context="${roleContext}" class="form" style="margin-top:0.75rem;">
             <div class="grid cols-2">
               <div class="field">
@@ -6329,30 +7577,90 @@
     `;
   }
 
+  function getComandaPaymentSplits(comandaId, total) {
+    uiState.finalizeSplitsByComanda = uiState.finalizeSplitsByComanda || {};
+    const normalizedTotal = Math.max(0, parseNumber(total || 0));
+    if (!Array.isArray(uiState.finalizeSplitsByComanda[comandaId]) || !uiState.finalizeSplitsByComanda[comandaId].length) {
+      uiState.finalizeSplitsByComanda[comandaId] = [
+        { method: "dinheiro", amount: normalizedTotal.toFixed(2) }
+      ];
+    }
+    return uiState.finalizeSplitsByComanda[comandaId];
+  }
+
+  function syncSplitsFromForm(form, comandaId) {
+    if (!form || !comandaId) return;
+    const methodEls = form.querySelectorAll('[data-role="payment-method"]');
+    const amountEls = form.querySelectorAll('[data-role="payment-amount"]');
+    const rows = [];
+    for (let i = 0; i < methodEls.length; i++) {
+      rows.push({
+        method: String(methodEls[i]?.value || "dinheiro").trim(),
+        amount: String(amountEls[i]?.value ?? "").trim()
+      });
+    }
+    if (rows.length) {
+      uiState.finalizeSplitsByComanda = uiState.finalizeSplitsByComanda || {};
+      uiState.finalizeSplitsByComanda[comandaId] = rows;
+    }
+  }
+
   function renderFinalizePanel(comanda) {
     const total = comandaTotal(comanda);
-    const totalFixed = Number(total || 0).toFixed(2);
-    const methodOptions = PAYMENT_METHODS.map((m) => `<option value="${m.value}">${m.label}</option>`).join("");
-    const zeroTotalNote = Math.max(0, parseNumber(total || 0)) <= 0.01
+    const isZeroTotal = Math.max(0, parseNumber(total || 0)) <= 0.01;
+    const splits = getComandaPaymentSplits(comanda.id, total);
+
+    const zeroTotalNote = isZeroTotal
       ? `<div class="note">Esta comanda totaliza ${money(0)}. Voce pode finalizar sem informar pagamento.</div>`
-      : `<div class="note">Confira os dados e escolha a forma de pagamento.</div>`;
+      : `<div class="note">Informe as formas de pagamento (dinheiro, cartao, pix, etc.). Voce pode dividir o total em varias formas.</div>`;
+
+    const splitsHtml = splits.map((split, index) => {
+      const methodOptions = PAYMENT_METHODS.map((m) =>
+        `<option value="${m.value}" ${m.value === split.method ? "selected" : ""}>${m.label}</option>`
+      ).join("");
+      return `
+        <div class="payment-split-row card" style="display:flex; flex-wrap:wrap; gap:0.5rem; align-items:flex-end; margin-bottom:0.6rem; padding:0.6rem; background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.1); border-radius:8px;">
+          <div style="flex:1; min-width:140px;">
+            <label style="font-size:0.8rem; display:block; margin-bottom:4px; font-weight:600;">Forma #${index + 1}</label>
+            <select name="paymentMethod_${index}" data-role="payment-method" data-index="${index}" style="width:100%;">
+              ${methodOptions}
+            </select>
+          </div>
+          <div style="flex:1; min-width:110px;">
+            <label style="font-size:0.8rem; display:block; margin-bottom:4px; font-weight:600;">Valor (R$)</label>
+            <input type="number" step="0.01" min="0" name="paymentAmount_${index}" data-role="payment-amount" data-index="${index}" value="${split.amount}" style="width:100%;" />
+          </div>
+          ${splits.length > 1 ? `
+            <div>
+              <button type="button" class="btn danger compact-action" data-action="remove-payment-split" data-comanda-id="${comanda.id}" data-index="${index}" title="Remover esta forma" style="height:38px; padding:0 0.8rem;">✕</button>
+            </div>
+          ` : ""}
+        </div>
+      `;
+    }).join("");
+
     return `
       <form class="card form" data-role="finalize-form" data-comanda-id="${comanda.id}">
         <h4>Finalizacao da comanda ${esc(displayComandaId(comanda.id))}</h4>
         ${zeroTotalNote}
-        <div class="grid cols-2">
-          <div class="field">
-            <label>Forma de pagamento</label>
-            <select name="paymentMethodPrimary" data-role="payment-method">
-              ${methodOptions}
-            </select>
-          </div>
-          <div class="field">
-            <label>Valor a pagar</label>
-            <input name="paymentAmountPrimary" data-role="payment-amount" value="${totalFixed}" readonly />
-          </div>
+        
+        <div class="payment-splits-container" data-role="payment-splits-list">
+          ${splitsHtml}
         </div>
-        <div class="note" data-role="payment-breakdown-note">Divisao ainda nao conferida.</div>
+
+        <div style="display:flex; flex-wrap:wrap; justify-content:space-between; align-items:center; gap:0.5rem; margin:0.5rem 0 0.8rem 0;">
+          <button type="button" class="btn secondary compact-action" data-action="add-payment-split" data-comanda-id="${comanda.id}">
+            + Adicionar outra forma de pagamento
+          </button>
+          ${splits.length > 1 ? `
+            <button type="button" class="btn compact-action" data-action="auto-balance-payment" data-comanda-id="${comanda.id}" title="Ajusta a ultima forma para completar o total exato">
+              ⚡ Equilibrar valor restante
+            </button>
+          ` : ""}
+        </div>
+
+        <div class="note" data-role="payment-breakdown-note" style="padding:0.5rem; border-radius:6px; background:rgba(255,255,255,0.02); font-weight:500;">Divisao ainda nao conferida.</div>
+        
         <div class="field" data-role="fiado-box" style="display:none;">
           <label>Nome do cliente (obrigatorio no fiado)</label>
           <input name="fiadoCustomer" placeholder="Nome completo" />
@@ -6368,7 +7676,7 @@
           <label><input type="checkbox" name="manualCheck" data-role="manual-check" /> Pagamento conferido manualmente com cliente</label>
           <div class="note" data-role="manual-check-note" style="display:none;">No fiado, essa confirmacao e dispensada.</div>
         </div>
-        <div class="note"><b>Valor total:</b> ${money(total)}</div>
+        <div class="note" style="font-size:1.05rem;"><b>Valor total da comanda:</b> ${money(total)}</div>
         <div class="actions finalize-actions">
           <button class="btn secondary" type="button" data-action="print-client-receipt" data-comanda-id="${comanda.id}">Gerar Nota</button>
           <button class="btn ok" type="submit">Confirmar finalizacao</button>
@@ -6538,7 +7846,7 @@
 
         ${!fiadoEditMode && !isCollapsed
         ? `<div class="actions">
-          <button class="btn secondary" type="button" data-action="print-order-ticket" data-comanda-id="${comanda.id}">Enviar pedido</button>
+          <button class="btn secondary" type="button" data-action="print-order-ticket" data-comanda-id="${comanda.id}">Enviar pedidos</button>
           ${canDeleteComanda ? `<button class="btn danger" type="button" data-action="delete-comanda" data-comanda-id="${comanda.id}">Excluir comanda</button>` : ""}
           <button class="btn primary" type="button" data-action="toggle-finalize" data-comanda-id="${comanda.id}">${isFinalizeOpen ? "Fechar painel" : "Finalizar comanda"}</button>
         </div>`
@@ -7021,8 +8329,11 @@
       ? `#${activeEl.id}`
       : activeEl?.dataset?.role
         ? `[data-role="${activeEl.dataset.role}"]`
-        : null;
+        : activeEl?.name
+          ? `${activeEl.tagName.toLowerCase()}[name="${activeEl.name}"]`
+          : null;
     const isInput = activeEl && (activeEl.tagName === "INPUT" || activeEl.tagName === "TEXTAREA");
+    const activeVal = isInput ? activeEl.value : null;
     const selectionStart = isInput ? activeEl.selectionStart : null;
     const selectionEnd = isInput ? activeEl.selectionEnd : null;
     const scrollY = window.scrollY;
@@ -7687,7 +8998,7 @@
     const waitingBefore = totalKitchenQueueMs();
 
     const item = {
-      id: `IT-${String(state.seq.item++).padStart(5, "0")}`,
+      id: generateUniqueItemId(state),
       productId: product.id,
       name: product.name,
       category: product.category,
@@ -8146,7 +9457,7 @@
     const actor = currentActor();
     const name = removeAccents(form.name.value.trim());
     const category = form.category.value;
-    const subcategory = category === "Bebidas" ? "Geral" : category === "Lanche" ? String(form.lancheSubcategory?.value || "Lanches") : "";
+    const subcategory = (category === "Bar" || category === "Bebidas") ? "Geral" : "";
     const available = Boolean(form.available?.checked);
     const requiresKitchen = KITCHEN_CATEGORIES.has(category) ? true : category === "Ofertas" ? Boolean(form.offerNeedsKitchen?.checked) : false;
     const price = parseNumber(form.price.value);
@@ -8183,7 +9494,7 @@
     const availablePrompt = prompt("Disponivel no cardapio? (sim/nao):", p.available === false ? "nao" : "sim");
     if (availablePrompt === null) return;
     const available = !["nao", "n", "0", "false"].includes(availablePrompt.trim().toLowerCase());
-    p.subcategory = p.category === "Bebidas" ? "Geral" : "";
+    p.subcategory = (p.category === "Bar" || p.category === "Bebidas") ? "Geral" : "";
     if (KITCHEN_CATEGORIES.has(p.category)) {
       p.requiresKitchen = true;
     } else if (p.category === "Ofertas") {
@@ -8855,7 +10166,7 @@
       const waitingBefore = totalKitchenQueueMs();
       const createdAt = isoNow();
       const item = {
-        id: `IT-${String(state.seq.item++).padStart(5, "0")}`,
+        id: generateUniqueItemId(state),
         productId: product.id,
         name: product.name,
         category: product.category,
@@ -8961,7 +10272,7 @@
       notes: note ? [note] : ["Venda avulsa"],
       items: [
         {
-          id: `IT-${String(state.seq.item++).padStart(5, "0")}`,
+          id: generateUniqueItemId(state),
           productId: product.id,
           name: product.name,
           category: product.category,
@@ -9312,6 +10623,8 @@
     });
 
     saveState();
+    publishKitchenOrderUpsert(comanda, [item], actor, "Prioridade alterada");
+    publishComandaUpsert(comanda, [item], actor, "Prioridade alterada");
     render();
   }
 
@@ -9403,6 +10716,8 @@
     }
 
     saveState();
+    publishKitchenOrderUpsert(comanda, [item], actor, `Status cozinha: ${kitchenStatusLabel(status)}`);
+    publishComandaUpsert(comanda, [item], actor, `Status cozinha: ${kitchenStatusLabel(status)}`);
     render();
   }
 
@@ -9500,6 +10815,8 @@
     comanda.kitchenAlertUnread = kitchenAlertCount(comanda) > 0;
 
     saveState();
+    publishComandaUpsert(comanda, [item], actor, "Item cancelado");
+    publishKitchenOrderUpsert(comanda, [item], actor, "Item cancelado");
     render();
   }
 
@@ -9521,6 +10838,7 @@
     });
 
     saveState();
+    publishComandaUpsert(comanda, [], actor, "Observacao adicionada");
     render();
   }
 
@@ -9597,6 +10915,7 @@
     });
 
     saveState();
+    publishComandaDeleted(deletedId, actor, "Comanda excluida");
     render();
   }
 
@@ -10074,13 +11393,25 @@
   }
 
   function parseFinalizePaymentSplits(form, total) {
-    return parseFinalizePaymentRows([
-      {
-        method: String(form.paymentMethodPrimary?.value || "").trim(),
+    if (!form) return { error: "Formulario nao encontrado." };
+    const methodEls = form.querySelectorAll('[data-role="payment-method"]');
+    const amountEls = form.querySelectorAll('[data-role="payment-amount"]');
+    const rawRows = [];
+    for (let i = 0; i < methodEls.length; i++) {
+      rawRows.push({
+        method: String(methodEls[i]?.value || "").trim(),
+        amountRaw: String(amountEls[i]?.value || "0").trim(),
+        rowName: `pagamento ${i + 1}`
+      });
+    }
+    if (!rawRows.length && form.paymentMethodPrimary) {
+      rawRows.push({
+        method: String(form.paymentMethodPrimary.value || "").trim(),
         amountRaw: String(form.paymentAmountPrimary?.value || "0").trim(),
         rowName: "pagamento"
-      }
-    ], total);
+      });
+    }
+    return parseFinalizePaymentRows(rawRows, total);
   }
 
   function updateFinalizePaymentUi(form) {
@@ -10090,13 +11421,17 @@
     const manualCheck = form.querySelector('[data-role="manual-check"]');
     const manualCheckNote = form.querySelector('[data-role="manual-check-note"]');
     const breakdownNote = form.querySelector('[data-role="payment-breakdown-note"]');
+    const submitBtn = form.querySelector('button[type="submit"]');
     const comandaId = String(form.dataset.comandaId || "");
     const comanda = findOpenComanda(comandaId);
     const total = comanda ? comandaTotal(comanda) : 0;
     const isZeroTotal = Math.max(0, parseNumber(total || 0)) <= 0.01;
-    const selectedMethods = [
-      String(form.paymentMethodPrimary?.value || "").trim()
-    ].filter(Boolean);
+
+    // Sync input values to uiState
+    syncSplitsFromForm(form, comandaId);
+
+    const methodEls = Array.from(form.querySelectorAll('[data-role="payment-method"]'));
+    const selectedMethods = methodEls.map((el) => String(el.value || "").trim()).filter(Boolean);
 
     const parsed = parseFinalizePaymentSplits(form, total);
     const splits = parsed.value || [];
@@ -10120,14 +11455,21 @@
     }
 
     if (breakdownNote) {
-      if (parsed.error) {
-        breakdownNote.textContent = parsed.error;
-      } else if (isZeroTotal) {
+      if (isZeroTotal) {
         breakdownNote.textContent = "Comanda zerada. Nenhum pagamento precisa ser informado para finalizar.";
+        breakdownNote.style.color = "";
+      } else if (parsed.error) {
+        breakdownNote.textContent = `⚠️ ${parsed.error}`;
+        breakdownNote.style.color = "#ff6b6b";
       } else {
         const paid = splits.reduce((sum, row) => sum + parseNumber(row.amount || 0), 0);
-        breakdownNote.textContent = `Pagamento informado: ${paymentSplitsText(splits, { includeAmount: true })} | Total conferido: ${money(paid)}.`;
+        breakdownNote.textContent = `✓ Pagamento conferido (${money(paid)}): ${paymentSplitsText(splits, { includeAmount: true })}.`;
+        breakdownNote.style.color = "#51cf66";
       }
+    }
+
+    if (submitBtn && !isZeroTotal) {
+      submitBtn.disabled = Boolean(parsed.error);
     }
 
     if (!isZeroTotal && hasPix && comanda) {
@@ -10229,8 +11571,10 @@
       uiState.waiterActiveComandaId = null;
     }
     delete uiState.finalizeOpenByComanda[comanda.id];
+    delete (uiState.finalizeSplitsByComanda || {})[comanda.id];
 
     saveState();
+    publishComandaClosed(comanda, actor, "Comanda finalizada");
     render();
     const shouldPrint = confirm("Deseja imprimir a nota do cliente agora?");
     if (shouldPrint) {
@@ -10558,7 +11902,9 @@
     const notesText = (comanda?.notes || []).join(" | ");
 
     if (isOrderTicket) {
-      const targetItems = Array.isArray(options.itemsToPrint) ? options.itemsToPrint : (comanda?.items || []).filter((i) => i && !i.canceled);
+      const targetItems = Array.isArray(options.itemsToPrint)
+        ? options.itemsToPrint
+        : (comanda?.items || []).filter((i) => i && !i.canceled && i.category === "Cozinha");
       const groups = groupComandaItems(targetItems);
       const itemsText = groups
         .map(({ main, addons }) => {
@@ -10647,11 +11993,17 @@
 
     let itemsToPrint = [];
     if (isOrderTicket) {
-      itemsToPrint = (comanda.items || []).filter((i) => i && !i.canceled && !i.kitchenPrinted);
+      // REGRA: 'Enviar Pedidos' deve enviar APENAS pedidos da categoria 'Cozinha'
+      const kitchenItems = (comanda.items || []).filter((i) => i && !i.canceled && i.category === "Cozinha");
+      if (kitchenItems.length === 0) {
+        alert("Esta comanda não possui itens da categoria 'Cozinha' para enviar.");
+        return;
+      }
+      itemsToPrint = kitchenItems.filter((i) => !i.kitchenPrinted);
       if (itemsToPrint.length === 0) {
-        const reprint = confirm("Todos os itens desse pedido já foram enviados para a cozinha. Deseja reimprimir o pedido completo?");
+        const reprint = confirm("Todos os itens de Cozinha dessa comanda já foram enviados. Deseja reimprimir o pedido da Cozinha?");
         if (reprint) {
-          itemsToPrint = (comanda.items || []).filter((i) => i && !i.canceled);
+          itemsToPrint = kitchenItems;
         } else {
           return;
         }
@@ -11342,6 +12694,61 @@
         return;
       }
 
+      if (action === "add-payment-split") {
+        const comandaId = button.dataset.comandaId;
+        const comanda = findOpenComanda(comandaId);
+        const total = comanda ? comandaTotal(comanda) : 0;
+        const form = button.closest('form[data-role="finalize-form"]');
+        if (form) syncSplitsFromForm(form, comandaId);
+
+        const splits = getComandaPaymentSplits(comandaId, total);
+        const currentPaid = splits.reduce((sum, s) => sum + parseNumber(s.amount || 0), 0);
+        const diff = Math.max(0, Math.round((total - currentPaid) * 100) / 100);
+        const usedMethods = new Set(splits.map((s) => s.method));
+        const nextMethod = PAYMENT_METHODS.find((m) => !usedMethods.has(m.value))?.value || "maquineta_debito";
+
+        splits.push({ method: nextMethod, amount: diff.toFixed(2) });
+        render();
+        const updatedForm = document.querySelector(`form[data-role="finalize-form"][data-comanda-id="${comandaId}"]`);
+        if (updatedForm) updateFinalizePaymentUi(updatedForm);
+        return;
+      }
+
+      if (action === "remove-payment-split") {
+        const comandaId = button.dataset.comandaId;
+        const index = parseInt(button.dataset.index, 10);
+        const form = button.closest('form[data-role="finalize-form"]');
+        if (form) syncSplitsFromForm(form, comandaId);
+
+        const splits = getComandaPaymentSplits(comandaId);
+        if (splits.length > 1 && !isNaN(index)) {
+          splits.splice(index, 1);
+          render();
+          const updatedForm = document.querySelector(`form[data-role="finalize-form"][data-comanda-id="${comandaId}"]`);
+          if (updatedForm) updateFinalizePaymentUi(updatedForm);
+        }
+        return;
+      }
+
+      if (action === "auto-balance-payment") {
+        const comandaId = button.dataset.comandaId;
+        const comanda = findOpenComanda(comandaId);
+        const total = comanda ? comandaTotal(comanda) : 0;
+        const form = button.closest('form[data-role="finalize-form"]');
+        if (form) syncSplitsFromForm(form, comandaId);
+
+        const splits = getComandaPaymentSplits(comandaId, total);
+        if (splits.length > 0) {
+          const otherPaid = splits.slice(0, -1).reduce((sum, s) => sum + parseNumber(s.amount || 0), 0);
+          const balance = Math.max(0, Math.round((total - otherPaid) * 100) / 100);
+          splits[splits.length - 1].amount = balance.toFixed(2);
+          render();
+          const updatedForm = document.querySelector(`form[data-role="finalize-form"][data-comanda-id="${comandaId}"]`);
+          if (updatedForm) updateFinalizePaymentUi(updatedForm);
+        }
+        return;
+      }
+
       if (action === "print-comanda") {
         await printComanda(button.dataset.comandaId);
         return;
@@ -11757,6 +13164,34 @@
     if (document.visibilityState === "hidden") return;
     void pollSupabaseRemoteMetadata();
   }, CLOUD_POLL_INTERVAL_MS);
+
+  if (typeof document !== "undefined") {
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "visible") {
+        broadcastPresencePing();
+        if (supabaseCtx.client) {
+          void pollSupabaseRemoteMetadata();
+          void pullStateFromSupabase();
+          if (!supabaseCtx.connected) {
+            void connectSupabase();
+          }
+        }
+      }
+    });
+  }
+
+  if (typeof window !== "undefined") {
+    window.addEventListener("online", () => {
+      setSupabaseStatus("conectando", "Rede restabelecida...");
+      clearSupabaseReconnectTimer();
+      void connectSupabase();
+      void pullStateFromSupabase();
+    });
+
+    window.addEventListener("offline", () => {
+      setSupabaseStatus("aviso", "Sem conexao com a internet.");
+    });
+  }
 
   broadcastPresencePing();
   void connectSupabase();
