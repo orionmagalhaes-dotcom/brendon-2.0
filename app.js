@@ -20,6 +20,8 @@
   const FINAL_CLIENT_PREP_SIGNATURE = "2026-02-25-final-client";
   const CATALOG_BACKUPS_META_KEY = "catalogBackups";
   const CATALOG_BACKUPS_LIMIT = 30;
+  const SUPABASE_BACKUPS_TABLE = "restobar_backups";
+  const BACKUP_AUTO_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6 horas
   const EDUARDO_RECOVERY_MARKER_KEY = "eduardo_restore_applied_v1";
   const ACCESS_CODE_WAITER_PREFIX = "Garcom Codigo";
   const SYSTEM_TEST_MARKERS = Object.freeze(["teste", "test", "mock", "pixteste", "cupom de teste"]);
@@ -125,7 +127,11 @@
     quickSalePaidConfirm: true,
     printerPrefs: loadPrinterPrefs(),
     qzSecurityConfigured: false,
-    initialCloudLoadComplete: false
+    initialCloudLoadComplete: false,
+    backupsList: null,
+    backupsLoading: false,
+    backupsError: "",
+    backupsLastLoadedAt: null
   };
 
   const DEV_SHADOW_USER = Object.freeze({
@@ -3817,6 +3823,105 @@
     }
   }
 
+  // ─────────────────────────────────────────────────────────────────────────
+  // SISTEMA DE BACKUP — snapshots periodicos na tabela restobar_backups
+  // Os backups NUNCA sao apagados automaticamente. So por acao manual no sistema.
+  // ─────────────────────────────────────────────────────────────────────────
+
+  function buildBackupSnapshot(reason) {
+    const now = isoNow();
+    const id = `bkp-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    return {
+      id,
+      reason: String(reason || "auto").slice(0, 64),
+      created_at: now,
+      payload: {
+        users: JSON.parse(JSON.stringify(Array.isArray(state.users) ? state.users : [])),
+        products: JSON.parse(JSON.stringify(Array.isArray(state.products) ? state.products : [])),
+        payables: JSON.parse(JSON.stringify(Array.isArray(state.payables) ? state.payables : [])),
+        financeCycleReports: JSON.parse(JSON.stringify(Array.isArray(state.financeCycleReports) ? state.financeCycleReports : [])),
+        cashHtmlReports: JSON.parse(JSON.stringify((Array.isArray(state.cashHtmlReports) ? state.cashHtmlReports : []).map(r => ({ id: r.id, createdAt: r.createdAt, closedAt: r.closedAt, cashId: r.cashId, createdByName: r.createdByName, createdByRole: r.createdByRole, referenceDay: r.referenceDay })))),
+        internalCashAudits: JSON.parse(JSON.stringify((Array.isArray(state.internalCashAudits) ? state.internalCashAudits : []).map(a => ({ id: a.id, createdAt: a.createdAt, closedAt: a.closedAt, cashId: a.cashId, summary: a.summary })))),
+        history90_meta: (Array.isArray(state.history90) ? state.history90 : []).map(h => ({ id: h.id, cashId: h.cashId, openedAt: h.openedAt, closedAt: h.closedAt, summary: h.summary })),
+        meta_snapshot: {
+          updatedAt: state.meta?.updatedAt || "",
+          catalogBackupSignature: state.meta?.catalogBackupSignature || ""
+        }
+      }
+    };
+  }
+
+  async function pushBackupToSupabase(reason) {
+    const client = getSupabaseClient();
+    if (!client) return;
+    try {
+      const snapshot = buildBackupSnapshot(reason);
+      const { error } = await client
+        .from(SUPABASE_BACKUPS_TABLE)
+        .insert({ id: snapshot.id, reason: snapshot.reason, created_at: snapshot.created_at, payload: snapshot.payload });
+      if (error) {
+        console.warn("[backup] Falha ao criar backup:", error.message);
+      } else {
+        console.log("[backup] Backup criado com sucesso:", snapshot.id, "motivo:", reason);
+        // Atualiza lista em cache se estiver carregada
+        if (Array.isArray(uiState.backupsList)) {
+          uiState.backupsList = [snapshot, ...uiState.backupsList];
+        }
+      }
+    } catch (err) {
+      console.warn("[backup] Excecao ao criar backup:", err);
+    }
+  }
+
+  async function listBackupsFromSupabase() {
+    const client = getSupabaseClient();
+    if (!client) return [];
+    try {
+      const { data, error } = await client
+        .from(SUPABASE_BACKUPS_TABLE)
+        .select("id, reason, created_at, payload")
+        .order("created_at", { ascending: false })
+        .limit(500);
+      if (error) {
+        console.warn("[backup] Falha ao listar backups:", error.message);
+        return [];
+      }
+      return Array.isArray(data) ? data : [];
+    } catch (err) {
+      console.warn("[backup] Excecao ao listar backups:", err);
+      return [];
+    }
+  }
+
+  async function deleteBackupFromSupabase(backupId) {
+    const client = getSupabaseClient();
+    if (!client) return false;
+    try {
+      const { error } = await client
+        .from(SUPABASE_BACKUPS_TABLE)
+        .delete()
+        .eq("id", backupId);
+      if (error) {
+        console.warn("[backup] Falha ao excluir backup:", error.message);
+        return false;
+      }
+      if (Array.isArray(uiState.backupsList)) {
+        uiState.backupsList = uiState.backupsList.filter(b => b.id !== backupId);
+      }
+      return true;
+    } catch (err) {
+      console.warn("[backup] Excecao ao excluir backup:", err);
+      return false;
+    }
+  }
+
+  function startAutoBackupInterval() {
+    setInterval(() => {
+      void pushBackupToSupabase("auto-6h");
+    }, BACKUP_AUTO_INTERVAL_MS);
+    console.log("[backup] Backup automatico agendado a cada 6h.");
+  }
+
   async function pullStateFromSupabase() {
     console.log("[pullStateFromSupabase] Starting, current local openComandas count:", state.openComandas?.length);
     const client = getSupabaseClient();
@@ -4119,6 +4224,8 @@
       }
     }
     scheduleSupabaseSync();
+    // Inicia backup automatico a cada 6h apos a conexao inicial
+    startAutoBackupInterval();
   }
 
   function getCurrentUser() {
@@ -7009,6 +7116,68 @@
     `;
   }
 
+  function renderAdminBackup() {
+    const backups = Array.isArray(uiState.backupsList) ? uiState.backupsList : null;
+    const loading = uiState.backupsLoading;
+    const error = uiState.backupsError || "";
+
+    const reasonLabel = (reason) => {
+      const map = {
+        "fechamento-caixa": "Fechamento de Caixa",
+        "alteracao-catalogo": "Alteracao no Catalogo",
+        "manual": "Backup Manual",
+        "auto-6h": "Automatico (6h)",
+        "auto": "Automatico"
+      };
+      return map[reason] || String(reason || "desconhecido");
+    };
+
+    const backupRows = backups
+      ? backups.map(b => {
+          const p = b.payload || {};
+          const users = Array.isArray(p.users) ? p.users.length : "?";
+          const products = Array.isArray(p.products) ? p.products.length : "?";
+          const payables = Array.isArray(p.payables) ? p.payables.length : "?";
+          const reports = Array.isArray(p.cashHtmlReports) ? p.cashHtmlReports.length : "?";
+          return `<tr>
+            <td data-label="Data">${esc(formatDateTime(b.created_at))}</td>
+            <td data-label="Motivo"><span class="note">${esc(reasonLabel(b.reason))}</span></td>
+            <td data-label="Dados">${products} produtos &bull; ${users} func. &bull; ${payables} fiados &bull; ${reports} relat.</td>
+            <td data-label="Acoes"><div class="actions">
+              <button class="btn danger compact-action" data-action="delete-backup" data-backup-id="${esc(b.id)}">Excluir</button>
+            </div></td>
+          </tr>`;
+        }).join("")
+      : "";
+
+    return `
+      <div class="card">
+        <h3>Sistema de Backup</h3>
+        <p class="note" style="margin-top:0.35rem;">Backups automaticos sao criados a cada 6 horas e ao fechar o caixa. Backups so sao excluidos manualmente.</p>
+        <div class="actions" style="margin-top:0.75rem;">
+          <button class="btn primary" data-action="backup-now" id="backup-now-btn">Fazer Backup Agora</button>
+          <button class="btn secondary" data-action="backup-refresh-list" id="backup-refresh-btn">${loading ? "Carregando..." : "Atualizar Lista"}</button>
+        </div>
+        ${error ? `<p class="note" style="margin-top:0.5rem; color:#e74c3c;">${esc(error)}</p>` : ""}
+      </div>
+      <div class="card" style="margin-top:0.75rem;">
+        <h3>Backups Disponiveis</h3>
+        ${loading
+          ? `<div class="empty" style="margin-top:0.75rem;">Carregando backups...</div>`
+          : backups === null
+            ? `<div class="empty" style="margin-top:0.75rem;">Clique em <b>Atualizar Lista</b> para ver os backups salvos no Supabase.</div>`
+            : backups.length === 0
+              ? `<div class="empty" style="margin-top:0.75rem;">Nenhum backup encontrado. Clique em <b>Fazer Backup Agora</b> para criar o primeiro.</div>`
+              : `<div class="table-wrap" style="margin-top:0.75rem;"><table class="responsive-stack">
+                  <thead><tr><th>Data</th><th>Motivo</th><th>Dados no Snapshot</th><th>Acoes</th></tr></thead>
+                  <tbody>${backupRows}</tbody>
+                </table></div>
+                <p class="note" style="margin-top:0.5rem;">${backups.length} backup(s) no total. Backups sao permanentes ate excluidos manualmente.</p>`
+        }
+      </div>
+    `;
+  }
+
   function renderAdminKitchen() {
     return `
       <div class="card" style="margin-bottom:0.8rem;">
@@ -7035,7 +7204,8 @@
       { key: "cozinha", label: "Cozinha" },
       { key: "financeiro", label: "Financas" },
       { key: "caixa", label: "Fechar Caixa" },
-      { key: "arquivos_html", label: "Contas" }
+      { key: "arquivos_html", label: "Contas" },
+      { key: "backup", label: "Backup" }
     ];
 
     let content = "";
@@ -7060,6 +7230,9 @@
         break;
       case "arquivos_html":
         content = renderAdminCashHtmlArchive();
+        break;
+      case "backup":
+        content = renderAdminBackup();
         break;
       default:
         content = renderAdminComandas();
@@ -7363,6 +7536,7 @@
       { key: "financeiro", label: "Financas" },
       { key: "caixa", label: "Fechar Caixa" },
       { key: "arquivos_html", label: "Contas" },
+      { key: "backup", label: "Backup" },
       { key: "ferramentas-dev", label: "Ferramentas Dev" }
     ];
 
@@ -7391,6 +7565,9 @@
         break;
       case "arquivos_html":
         content = renderAdminCashHtmlArchive();
+        break;
+      case "backup":
+        content = renderAdminBackup();
         break;
       case "ferramentas-dev":
         content = renderDevTools();
@@ -12366,6 +12543,8 @@
       reason: "fechamento_caixa",
       cloudDelayMs: 0
     });
+    // Cria backup automatico no Supabase ao fechar caixa
+    void pushBackupToSupabase("fechamento-caixa");
     openCashHtmlReportRecord(archivedHtmlReport, {
       previewTitle: reportOptions.title,
       previewSubtitle: `${reportOptions.subtitle} | Arquivo ${archivedHtmlReport.id}`
@@ -12812,6 +12991,59 @@
       if (action === "close-comanda-details") {
         uiState.adminInlineEditComandaId = null;
         uiState.comandaDetailsId = null;
+        render();
+        return;
+      }
+
+      if (action === "backup-now") {
+        const btn = document.getElementById("backup-now-btn");
+        if (btn) { btn.disabled = true; btn.textContent = "Salvando..."; }
+        try {
+          await pushBackupToSupabase("manual");
+          // Recarrega a lista apos criar
+          uiState.backupsLoading = true;
+          render();
+          uiState.backupsList = await listBackupsFromSupabase();
+          uiState.backupsLoading = false;
+          uiState.backupsError = "";
+          uiState.backupsLastLoadedAt = isoNow();
+        } catch (err) {
+          uiState.backupsLoading = false;
+          uiState.backupsError = "Falha ao criar backup: " + String(err?.message || err || "");
+        }
+        render();
+        return;
+      }
+
+      if (action === "backup-refresh-list") {
+        if (uiState.backupsLoading) return;
+        uiState.backupsLoading = true;
+        uiState.backupsError = "";
+        render();
+        try {
+          uiState.backupsList = await listBackupsFromSupabase();
+          uiState.backupsLastLoadedAt = isoNow();
+        } catch (err) {
+          uiState.backupsError = "Falha ao carregar backups: " + String(err?.message || err || "");
+        }
+        uiState.backupsLoading = false;
+        render();
+        return;
+      }
+
+      if (action === "delete-backup") {
+        const backupId = button.dataset.backupId;
+        if (!backupId) return;
+        const actor = currentActor();
+        if (!isAdminOrDev(actor)) {
+          alert("Apenas admin ou dev pode excluir backups.");
+          return;
+        }
+        if (!confirm("Tem certeza que deseja excluir este backup? Esta acao nao pode ser desfeita.")) return;
+        const ok = await deleteBackupFromSupabase(backupId);
+        if (!ok) {
+          alert("Falha ao excluir o backup. Tente novamente.");
+        }
         render();
         return;
       }
