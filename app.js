@@ -112,6 +112,10 @@
     waiterKitchenReceiptNotices: [],
     waiterKitchenReceiptSeenMap: {},
     waiterDraftByComanda: {},
+    // O servidor pode atualizar a tela enquanto o garçom está escolhendo um item.
+    // Mantemos o rascunho do formulário fora do DOM para que a escolha não volte
+    // silenciosamente para o primeiro produto da categoria após uma sincronização.
+    comandaItemFormByKey: {},
     persistedDetailsOpen: {},
     itemSelector: {
       open: false,
@@ -8496,7 +8500,73 @@
     `;
   }
 
+  function comandaItemFormKey(form) {
+    const role = String(form?.dataset?.role || "").trim();
+    const comandaId = String(form?.dataset?.comandaId || "").trim();
+    return role && comandaId ? `${role}::${comandaId}` : "";
+  }
+
+  function getComandaItemFormValues(form) {
+    const key = comandaItemFormKey(form);
+    return key ? uiState.comandaItemFormByKey?.[key] : null;
+  }
+
+  function persistComandaItemFormValues() {
+    document.querySelectorAll('form[data-role="add-item-form"], form[data-role="fiado-add-item-form"]').forEach((form) => {
+      const key = comandaItemFormKey(form);
+      if (!key) return;
+      uiState.comandaItemFormByKey[key] = {
+        category: String(form.category?.value || ""),
+        subcategory: String(form.subcategory?.value || ""),
+        productId: String(form.productId?.value || ""),
+        searchTerm: String(form.querySelector('[data-role="item-product-search"]')?.value || ""),
+        qty: String(form.qty?.value || "1"),
+        customize: Boolean(form.querySelector('[data-role="customize-item-check"]')?.checked),
+        hasNote: Boolean(form.querySelector('[data-role="item-has-note-check"]')?.checked),
+        isDelivery: Boolean(form.querySelector('[data-role="item-is-delivery-check"]')?.checked),
+        waiterNote: String(form.waiterNote?.value || ""),
+        deliveryRecipient: String(form.deliveryRecipient?.value || ""),
+        deliveryLocation: String(form.deliveryLocation?.value || ""),
+        addonProductIds: Array.from(form.querySelector('[data-role="lanche-addon-products"]')?.selectedOptions || []).map((option) => String(option.value)),
+        addonForItemId: String(form.addonForItemId?.value || "")
+      };
+    });
+  }
+
+  function restoreComandaItemFormValues(form) {
+    const saved = getComandaItemFormValues(form);
+    if (!saved) return;
+    if (form.category && saved.category) form.category.value = saved.category;
+    if (form.subcategory && saved.subcategory) form.subcategory.value = saved.subcategory;
+    if (form.qty) form.qty.value = saved.qty || "1";
+    if (form.waiterNote) form.waiterNote.value = saved.waiterNote || "";
+    if (form.deliveryRecipient) form.deliveryRecipient.value = saved.deliveryRecipient || "";
+    if (form.deliveryLocation) form.deliveryLocation.value = saved.deliveryLocation || "";
+    const searchInput = form.querySelector('[data-role="item-product-search"]');
+    if (searchInput) searchInput.value = saved.searchTerm || "";
+    const customize = form.querySelector('[data-role="customize-item-check"]');
+    const hasNote = form.querySelector('[data-role="item-has-note-check"]');
+    const isDelivery = form.querySelector('[data-role="item-is-delivery-check"]');
+    if (customize) customize.checked = Boolean(saved.customize);
+    if (hasNote) hasNote.checked = Boolean(saved.hasNote);
+    if (isDelivery) isDelivery.checked = Boolean(saved.isDelivery);
+  }
+
+  function restoreComandaItemAddonValues(form) {
+    const saved = getComandaItemFormValues(form);
+    if (!saved) return;
+    const addonProducts = form.querySelector('[data-role="lanche-addon-products"]');
+    if (addonProducts) {
+      const selected = new Set(saved.addonProductIds || []);
+      Array.from(addonProducts.options).forEach((option) => {
+        option.selected = selected.has(String(option.value));
+      });
+    }
+    if (form.addonForItemId) form.addonForItemId.value = saved.addonForItemId || "";
+  }
+
   function render() {
+    persistComandaItemFormValues();
     const deleteAuthFormBeforeRender = document.querySelector("#delete-comanda-auth-form");
     if (deleteAuthFormBeforeRender) {
       syncDeleteComandaAuthDraftFromForm(deleteAuthFormBeforeRender);
@@ -8577,7 +8647,11 @@
     });
 
     document.querySelectorAll('form[data-role="add-item-form"], form[data-role="fiado-add-item-form"]').forEach((form) => {
-      refreshComandaProductSelect(form);
+      restoreComandaItemFormValues(form);
+      refreshComandaProductSelect(form, {
+        selectedProductId: getComandaItemFormValues(form)?.productId
+      });
+      restoreComandaItemAddonValues(form);
     });
 
     document.querySelectorAll('[data-role="payment-method"]').forEach((select) => {
@@ -8697,7 +8771,7 @@
     if (options.resetSearch && searchInput) {
       searchInput.value = "";
     }
-    const selectedValue = String(productSel.value || "").trim();
+    const selectedValue = String(options.selectedProductId ?? (productSel.value || "")).trim();
     fillProductSelect(productSel, categorySel.value, {
       selectedValue,
       searchTerm: searchInput ? searchInput.value : "",
