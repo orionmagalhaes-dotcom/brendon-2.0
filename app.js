@@ -3119,7 +3119,9 @@
     const parsed = source && typeof source === "object" ? source : {};
     const paperWidthMm = Number(parsed.receiptPaperWidthMm || DEFAULT_RECEIPT_PAPER_WIDTH_MM);
     return {
-      kitchenDirectEnabled: parsed.kitchenDirectEnabled === true,
+      // Pedidos de cozinha devem sair diretamente na impressora: a prévia no
+      // navegador exigia uma segunda ação manual e atrasava a produção.
+      kitchenDirectEnabled: parsed.kitchenDirectEnabled !== false,
       kitchenPrinterName: String(parsed.kitchenPrinterName || "").trim(),
       receiptDirectEnabled: parsed.receiptDirectEnabled === true,
       receiptPrinterName: String(parsed.receiptPrinterName || "").trim(),
@@ -7013,6 +7015,7 @@
   function renderAdminPrinting() {
     const prefs = normalizePrinterPrefs(uiState.printerPrefs);
     const configuredName = prefs.receiptPrinterName || "Impressora padrao do Windows";
+    const kitchenPrinterName = prefs.kitchenPrinterName || "Impressora padrao do Windows";
     return `
       <div class="grid cols-2">
         <section class="card">
@@ -7039,8 +7042,24 @@
           </div>
         </section>
         <section class="card">
+          <h3>Impressora da cozinha</h3>
+          <p class="note">Ao clicar em <b>Enviar pedidos</b>, o pedido vai direto para esta impressora, sem abrir uma nova janela.</p>
+          <div class="field" style="margin-top:0.75rem;">
+            <label><input type="checkbox" data-role="kitchen-direct-enabled" ${prefs.kitchenDirectEnabled ? "checked" : ""} /> Imprimir pedidos automaticamente ao enviar</label>
+          </div>
+          <div class="field">
+            <label>Nome da impressora da cozinha neste dispositivo</label>
+            <input data-role="kitchen-printer-name" value="${esc(prefs.kitchenPrinterName)}" placeholder="Ex.: MTP-II Cozinha" />
+            <p class="note">Deixe vazio para usar a impressora padrao do Windows.</p>
+          </div>
+          <div class="actions">
+            <button class="btn primary" type="button" data-action="save-kitchen-printer-config">Salvar configuracao</button>
+          </div>
+          <p class="note" style="margin-top:0.75rem;">Destino atual: <b>${esc(kitchenPrinterName)}</b>. O QZ Tray precisa estar aberto nesta maquina.</p>
+        </section>
+        <section class="card">
           <h3>Status e emissao fiscal</h3>
-          <p class="note">Destino atual: <b>${esc(configuredName)}</b>.</p>
+          <p class="note">Destino do cupom do cliente: <b>${esc(configuredName)}</b>.</p>
           <p class="note">O cupom termico e impresso somente nesta maquina. Pedidos dos demais celulares sincronizam pelo Supabase, mas nao tentam usar o Bluetooth deles.</p>
           <p class="note">A MTP-II imprime o DANFE depois que a NFC-e for autorizada. A integracao com SEFAZ/provedor permanece bloqueada ate cadastrar UF, certificado e credenciais; o sistema nao apresenta cupom comum como documento fiscal.</p>
           <p class="note">Antes do primeiro uso: pareie a MTP-II neste dispositivo, instale a ponte de impressao compativel, defina o nome acima e deixe-a aberta.</p>
@@ -7194,7 +7213,7 @@
   }
 
   function renderAdmin(user) {
-    if (uiState.adminTab === "avulsa" || uiState.adminTab === "monitor" || uiState.adminTab === "impressao") {
+    if (uiState.adminTab === "avulsa" || uiState.adminTab === "monitor") {
       uiState.adminTab = "comandas";
     } else if (uiState.adminTab === "apagar") {
       uiState.adminTab = "financeiro";
@@ -7208,6 +7227,7 @@
       { key: "cozinha", label: "Cozinha" },
       { key: "financeiro", label: "Financas" },
       { key: "caixa", label: "Fechar Caixa" },
+      { key: "impressao", label: "Impressao" },
       { key: "arquivos_html", label: "Contas" },
       { key: "backup", label: "Backup" }
     ];
@@ -7231,6 +7251,9 @@
         break;
       case "caixa":
         content = renderAdminCash();
+        break;
+      case "impressao":
+        content = renderAdminPrinting();
         break;
       case "arquivos_html":
         content = renderAdminCashHtmlArchive();
@@ -12463,13 +12486,22 @@
       return true;
     }
 
-    if (uiState.printerPrefs?.receiptDirectEnabled) {
+    const directPrintEnabled = isOrderTicket
+      ? uiState.printerPrefs?.kitchenDirectEnabled
+      : uiState.printerPrefs?.receiptDirectEnabled;
+
+    if (directPrintEnabled) {
       try {
-        await printReceiptViaQz(html, comanda.id);
+        if (isOrderTicket) {
+          await printKitchenTicketViaQz(html, comanda.id);
+        } else {
+          await printReceiptViaQz(html, comanda.id);
+        }
       } catch (err) {
         const message = `Falha ao imprimir o pedido: ${String(err?.message || err)}\n\nConfira a MTP-II e o QZ Tray nesta maquina.`;
         if (!options.silent) alert(message);
         else console.warn(message);
+        return false;
       }
       if (isOrderTicket) {
         let markedAny = false;
