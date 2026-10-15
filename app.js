@@ -413,6 +413,40 @@
     return `IT-${String(seq).padStart(5, "0")}-${sessionChunk}${timeChunk}${randomChunk}`;
   }
 
+  function generateUniquePayableId(targetState) {
+    const rows = Array.isArray(targetState?.payables) ? targetState.payables : [];
+    const usedIds = new Set(rows.map((row) => String(row?.id || "").trim()).filter(Boolean));
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const uuid = typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+        ? crypto.randomUUID()
+        : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+      const candidate = `PG-${uuid}`;
+      if (!usedIds.has(candidate)) return candidate;
+    }
+    return `PG-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 16)}`;
+  }
+
+  function normalizeDuplicatePayableIds(targetState) {
+    if (!targetState || !Array.isArray(targetState.payables)) return false;
+    const usedIds = new Set();
+    let changed = false;
+    targetState.payables = targetState.payables.map((payable, index) => {
+      const originalId = String(payable?.id || "").trim() || `PG-LEGACY-${index + 1}`;
+      if (!usedIds.has(originalId)) {
+        usedIds.add(originalId);
+        return payable;
+      }
+      const base = String(payable?.comandaId || payable?.createdAt || index + 1).replace(/[^a-zA-Z0-9]/g, "").slice(-36) || String(index + 1);
+      let candidate = `PG-LEGACY-${base}`;
+      let suffix = 2;
+      while (usedIds.has(candidate)) candidate = `PG-LEGACY-${base}-${suffix++}`;
+      usedIds.add(candidate);
+      changed = true;
+      return { ...payable, id: candidate };
+    });
+    return changed;
+  }
+
   function browserNameFromUa(uaRaw) {
     const ua = String(uaRaw || "").toLowerCase();
     if (ua.includes("edg/")) return "Edge";
@@ -847,6 +881,27 @@
     return [...map.values()];
   }
 
+  function mergePayablesWithTimestamp(localRows, remoteRows, options = {}) {
+    const map = new Map();
+    const allowRemoteOnly = options.allowRemoteOnly !== false;
+    for (const row of Array.isArray(localRows) ? localRows : []) {
+      const id = String(row?.id || "").trim();
+      if (!id) continue;
+      const key = `${id}::${String(row?.comandaId || "").trim()}`;
+      map.set(key, row);
+    }
+    for (const row of Array.isArray(remoteRows) ? remoteRows : []) {
+      const id = String(row?.id || "").trim();
+      if (!id) continue;
+      const key = `${id}::${String(row?.comandaId || "").trim()}`;
+      if (!allowRemoteOnly && !map.has(key)) continue;
+      map.set(key, pickRowByTimestamp(map.get(key), row, options));
+    }
+    const mergedState = { payables: [...map.values()] };
+    normalizeDuplicatePayableIds(mergedState);
+    return mergedState.payables;
+  }
+
   function mergeAuditRows(localRows, remoteRows) {
     const seen = new Set();
     const merged = [];
@@ -1067,7 +1122,7 @@
       preferLocal,
       allowRemoteOnly: allowRemoteOperationalInsert
     });
-    const mergedPayables = mergeRowsByIdWithTimestamp(localState?.payables, remoteState?.payables, {
+    const mergedPayables = mergePayablesWithTimestamp(localState?.payables, remoteState?.payables, {
       getTimestamp: (row) => row?.updatedAt || row?.paidAt || row?.createdAt || "",
       preferLocal,
       allowRemoteOnly: allowRemoteOperationalInsert
@@ -3012,6 +3067,7 @@
       cash: { ...fallback.cash, ...(parsed.cash || {}) },
       session: { userId: parsed.session?.userId || null }
     };
+    normalizeDuplicatePayableIds(normalized);
     console.log("[normalizeStateShape] After initial normalization, openComandas count:", normalized.openComandas?.length);
     normalized.meta.deletedUserIds = sanitizeDeletedUserIds(normalized.meta.deletedUserIds, normalized);
     normalized.meta.deletedProductIds = sanitizeDeletedProductIds(normalized.meta.deletedProductIds, normalized);
@@ -11818,7 +11874,7 @@
     if (fiadoAmount > 0) {
       const createdAt = isoNow();
       state.payables.push({
-        id: `PG-${String(state.seq.payable++).padStart(5, "0")}`,
+        id: generateUniquePayableId(state),
         comandaId: comanda.id,
         customerName: fiadoCustomer,
         total: fiadoAmount,
