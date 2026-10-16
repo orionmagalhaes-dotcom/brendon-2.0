@@ -340,6 +340,15 @@
     return Boolean(closedAt && comandaAt && comandaAt <= closedAt);
   }
 
+  function commandasCreatedAfterCashClose(commandas, closedAt) {
+    const closedTs = parseUpdatedAtTimestamp(closedAt);
+    if (!closedTs) return Array.isArray(commandas) ? commandas : [];
+    return (Array.isArray(commandas) ? commandas : []).filter((comanda) => {
+      const comandaTs = comandaReferenceTimestamp(comanda);
+      return Boolean(comandaTs && comandaTs > closedTs);
+    });
+  }
+
   function comandaNumericPart(comandaId) {
     const match = /^CMD-(\d+)/i.exec(String(comandaId || "").trim());
     if (!match) return 0;
@@ -3467,11 +3476,21 @@
     const index = state.history90.findIndex((entry) => String(entry?.id || "") === String(closure.id));
     if (index >= 0) state.history90[index] = closure;
     else state.history90.unshift(closure);
-    state.openComandas = [];
-    state.closedComandas = [];
-    state.cookHistory = [];
-    state.auditLog = [];
-    uiState.remoteMonitorEvents = [];
+    // Um aparelho pode ter iniciado uma nova comanda entre o fechamento e o
+    // recebimento deste aviso. Mantemos somente registros posteriores ao
+    // fechamento; os anteriores ficam no historico ou sao descartados como
+    // dados atrasados do caixa encerrado.
+    state.openComandas = commandasCreatedAfterCashClose(state.openComandas, closedAt);
+    state.closedComandas = commandasCreatedAfterCashClose(state.closedComandas, closedAt);
+    state.cookHistory = (Array.isArray(state.cookHistory) ? state.cookHistory : []).filter(
+      (row) => parseUpdatedAtTimestamp(row?.updatedAt || row?.deliveredAt) > parseUpdatedAtTimestamp(closedAt)
+    );
+    state.auditLog = (Array.isArray(state.auditLog) ? state.auditLog : []).filter(
+      (row) => parseUpdatedAtTimestamp(row?.ts) > parseUpdatedAtTimestamp(closedAt)
+    );
+    uiState.remoteMonitorEvents = (Array.isArray(uiState.remoteMonitorEvents) ? uiState.remoteMonitorEvents : []).filter(
+      (row) => parseUpdatedAtTimestamp(row?.ts || row?.broadcastAt) > parseUpdatedAtTimestamp(closedAt)
+    );
     state.meta = state.meta || {};
     state.meta.cashClosedAt = closedAt;
     state.meta.realtimeAuditResetAt = closedAt;
