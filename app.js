@@ -325,6 +325,21 @@
     synchronizeCashOpenedAt(targetState);
   }
 
+  // Comandas de um caixa encerrado nao podem voltar por mensagens atrasadas de
+  // outros dispositivos. O marco persistente tambem protege quem ainda nao
+  // recebeu o historico completo do fechamento.
+  function isIncomingComandaFromClosedCash(comanda) {
+    if (!comanda || typeof comanda !== "object") return false;
+    const id = String(comanda.id || "").trim();
+    const archived = (state.history90 || []).some((closure) =>
+      (closure?.commandas || []).some((row) => String(row?.id || "").trim() === id)
+    );
+    if (archived) return true;
+    const closedAt = parseUpdatedAtTimestamp(state.meta?.cashClosedAt);
+    const comandaAt = comandaReferenceTimestamp(comanda);
+    return Boolean(closedAt && comandaAt && comandaAt <= closedAt);
+  }
+
   function comandaNumericPart(comandaId) {
     const match = /^CMD-(\d+)/i.exec(String(comandaId || "").trim());
     if (!match) return 0;
@@ -1043,6 +1058,7 @@
     }
     const operationalResetAt = resolveOperationalResetAtForMerge(localState, remoteState);
     const realtimeAuditResetAt = selectLatestTimestampIso(localMeta.realtimeAuditResetAt, remoteMeta.realtimeAuditResetAt);
+    const cashClosedAt = selectLatestTimestampIso(localMeta.cashClosedAt, remoteMeta.cashClosedAt);
     const financeCycleStartedAt = selectLatestTimestampIso(localMeta.financeCycleStartedAt, remoteMeta.financeCycleStartedAt);
     const catalogBackups = mergeCatalogBackups(localMeta[CATALOG_BACKUPS_META_KEY], remoteMeta[CATALOG_BACKUPS_META_KEY]);
     const deletedProductIdsRaw = normalizeDeletedIdList([
@@ -1193,6 +1209,7 @@
         deletedComandaIds,
         operationalResetAt,
         realtimeAuditResetAt,
+        cashClosedAt,
         financeCycleStartedAt
       },
       cash: (() => {
@@ -2389,6 +2406,7 @@
         financeCycleStartedAt: "",
         operationalResetAt: "",
         realtimeAuditResetAt: "",
+        cashClosedAt: "",
         [FINAL_CLIENT_PREP_FLAG]: true,
         [FINAL_CLIENT_PREP_MARKER]: isoNow(),
         [FINAL_CLIENT_PREP_SIGNATURE_KEY]: FINAL_CLIENT_PREP_SIGNATURE
@@ -3054,6 +3072,7 @@
         financeCycleStartedAt: normalizeIsoTimestamp(parsed.meta?.financeCycleStartedAt),
         operationalResetAt: "", // Clear operational reset to prevent data loss
         realtimeAuditResetAt: normalizeIsoTimestamp(parsed.meta?.realtimeAuditResetAt),
+        cashClosedAt: normalizeIsoTimestamp(parsed.meta?.cashClosedAt),
         [FINAL_CLIENT_PREP_FLAG]: parsed.meta?.[FINAL_CLIENT_PREP_FLAG] === true,
         [FINAL_CLIENT_PREP_MARKER]:
           typeof parsed.meta?.[FINAL_CLIENT_PREP_MARKER] === "string" && parsed.meta?.[FINAL_CLIENT_PREP_MARKER]
@@ -3423,11 +3442,53 @@
     broadcastRealtimePayload("comanda_deleted", payload);
   }
 
+  function publishCashClosed(closure, nextCash, actor) {
+    if (!closure?.id) return;
+    broadcastRealtimePayload("cash_closed", {
+      sessionId: clientSessionId,
+      broadcastAt: isoNow(),
+      updatedAt: normalizeIsoTimestamp(state.meta?.updatedAt) || isoNow(),
+      actorId: actor?.id ?? null,
+      actorRole: String(actor?.role || ""),
+      actorName: String(actor?.name || ""),
+      closure: cloneRealtimePayload(closure),
+      nextCash: cloneRealtimePayload(nextCash)
+    });
+  }
+
+  function applyCashClosed(payload) {
+    if (!payload || payload.sessionId === clientSessionId || !payload.closure?.id) return false;
+    const closure = payload.closure;
+    const closedAt = normalizeIsoTimestamp(closure.closedAt || payload.broadcastAt);
+    if (!closedAt) return false;
+    const knownClosedAt = parseUpdatedAtTimestamp(state.meta?.cashClosedAt);
+    if (knownClosedAt && parseUpdatedAtTimestamp(closedAt) < knownClosedAt) return false;
+    state.history90 = Array.isArray(state.history90) ? state.history90 : [];
+    const index = state.history90.findIndex((entry) => String(entry?.id || "") === String(closure.id));
+    if (index >= 0) state.history90[index] = closure;
+    else state.history90.unshift(closure);
+    state.openComandas = [];
+    state.closedComandas = [];
+    state.cookHistory = [];
+    state.auditLog = [];
+    uiState.remoteMonitorEvents = [];
+    state.meta = state.meta || {};
+    state.meta.cashClosedAt = closedAt;
+    state.meta.realtimeAuditResetAt = closedAt;
+    state.cash = payload.nextCash && typeof payload.nextCash === "object"
+      ? payload.nextCash
+      : { id: `CX-${state.seq.cash || 1}`, openedAt: "", date: todayISO(), updatedAt: isoNow() };
+    sanitizeOperationalComandasAgainstHistory(state);
+    saveState({ skipCloud: true, touchMeta: false });
+    return true;
+  }
+
   function applyComandaClosed(payload) {
     if (!payload || payload.sessionId === clientSessionId) return false;
     const incoming = payload.comanda;
     const comandaId = String(incoming?.id || payload.comandaId || "").trim();
     if (!comandaId) return false;
+    if (incoming && isIncomingComandaFromClosedCash(incoming)) return false;
 
     state.openComandas = (Array.isArray(state.openComandas) ? state.openComandas : []).filter(c => String(c?.id || "").trim() !== comandaId);
     const closedRows = Array.isArray(state.closedComandas) ? state.closedComandas : [];
@@ -3468,6 +3529,11 @@
     if (!payload || payload.sessionId === clientSessionId) return;
     switch (event) {
       case "state_changed":
+        rememberObservedRemoteUpdatedAt(payload.updatedAt);
+        void pullStateFromSupabase();
+        break;
+      case "cash_closed":
+        if (applyCashClosed(payload)) render();
         rememberObservedRemoteUpdatedAt(payload.updatedAt);
         void pullStateFromSupabase();
         break;
@@ -3549,6 +3615,7 @@
     const incoming = payload.comanda;
     const comandaId = String(incoming?.id || "").trim();
     if (!comandaId || !Array.isArray(incoming?.items)) return false;
+    if (isIncomingComandaFromClosedCash(incoming)) return false;
     const incomingHasKitchenOrder = incoming.items.some((item) => itemNeedsKitchen(item) && !item?.canceled);
     if (!incomingHasKitchenOrder) return false;
 
@@ -3574,6 +3641,7 @@
     const incoming = payload.comanda;
     const comandaId = String(incoming?.id || "").trim();
     if (!comandaId) return false;
+    if (isIncomingComandaFromClosedCash(incoming)) return false;
 
     const openRows = Array.isArray(state.openComandas) ? state.openComandas : [];
     const existingIndex = openRows.findIndex((comanda) => String(comanda?.id || "").trim() === comandaId);
@@ -3644,6 +3712,7 @@
   function saveState(options = {}) {
     const touchMeta = options.touchMeta !== false;
     state.meta = state.meta || {};
+    sanitizeOperationalComandasAgainstHistory(state);
     synchronizeCashOpenedAt(state);
     rollFinance30DayCycles(state, { nowIso: isoNow() });
     ensureCatalogBackup(state, "save");
@@ -4240,6 +4309,7 @@
       .on("broadcast", { event: "audit_event" }, (m) => handleIncomingRealtimeMessage("audit_event", m?.payload))
       .on("broadcast", { event: "presence_ping" }, (m) => handleIncomingRealtimeMessage("presence_ping", m?.payload))
       .on("broadcast", { event: "state_changed" }, (m) => handleIncomingRealtimeMessage("state_changed", m?.payload))
+      .on("broadcast", { event: "cash_closed" }, (m) => handleIncomingRealtimeMessage("cash_closed", m?.payload))
       .on("broadcast", { event: "kitchen_order_upsert" }, (m) => handleIncomingRealtimeMessage("kitchen_order_upsert", m?.payload))
       .on("broadcast", { event: "comanda_upsert" }, (m) => handleIncomingRealtimeMessage("comanda_upsert", m?.payload))
       .on("broadcast", { event: "comanda_closed" }, (m) => handleIncomingRealtimeMessage("comanda_closed", m?.payload))
@@ -12692,6 +12762,7 @@
     state.auditLog = [];
     uiState.remoteMonitorEvents = [];
     state.meta = state.meta || {};
+    state.meta.cashClosedAt = closedAt;
     state.meta.realtimeAuditResetAt = closedAt;
     state.cash = {
       id: `CX-${state.seq.cash++}`,
@@ -12699,6 +12770,8 @@
       date: todayISO(),
       updatedAt: isoNow()
     };
+
+    publishCashClosed(closure, state.cash, actor);
 
     saveState({
       actor,
