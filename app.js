@@ -508,7 +508,7 @@
     return parseUpdatedAtTimestamp(payable?.updatedAt || payable?.paidAt || payable?.createdAt || "");
   }
 
-  // Um fechamento de comanda deve gerar no maximo um fiado por comanda/status.
+  // Um fechamento de comanda deve gerar no maximo um fiado por comanda.
   // Versoes antigas criavam IDs diferentes durante retries e deixavam clones
   // do mesmo lancamento. Consolidamos sem somar clones, preservando a origem
   // em mergedDuplicateRecords para auditoria e eventual recuperacao manual.
@@ -519,8 +519,10 @@
     for (const payable of targetState.payables) {
       if (!payable || typeof payable !== "object") continue;
       const comandaId = String(payable.comandaId || "").trim();
-      const status = payable.status === "pago" ? "pago" : "pendente";
-      const key = comandaId ? `${comandaId}::${status}` : `id::${String(payable.id || "")}`;
+      // Status faz parte do estado do mesmo fiado (pendente -> pago), nao da
+      // identidade do lancamento. Agrupar por status permitia uma comanda
+      // aparecer duas vezes quando um cliente antigo reenviava um snapshot.
+      const key = comandaId ? comandaId : `id::${String(payable.id || "")}`;
       if (!groups.has(key)) groups.set(key, []);
       groups.get(key).push(payable);
     }
@@ -12069,18 +12071,31 @@
 
     if (fiadoAmount > 0) {
       const createdAt = isoNow();
-      state.payables.push({
-        id: generateUniquePayableId(state),
-        comandaId: comanda.id,
-        customerName: fiadoCustomer,
-        total: fiadoAmount,
-        status: "pendente",
-        createdAt,
-        updatedAt: createdAt,
-        paidAt: null,
-        paidMethod: null,
-        adjustments: []
-      });
+      // Idempotencia: reintentos de cierre/sincronizacion nao podem criar
+      // outro fiado para a mesma comanda, mesmo quando o snapshot local e
+      // antigo. Reaproveitamos o lancamento existente.
+      const existingPayable = state.payables.find((entry) => String(entry?.comandaId || "").trim() === String(comanda.id || "").trim());
+      if (existingPayable) {
+        if (existingPayable.status !== "pago") {
+          existingPayable.customerName = fiadoCustomer;
+          existingPayable.total = fiadoAmount;
+          existingPayable.status = "pendente";
+          existingPayable.updatedAt = createdAt;
+        }
+      } else {
+        state.payables.push({
+          id: generateUniquePayableId(state),
+          comandaId: comanda.id,
+          customerName: fiadoCustomer,
+          total: fiadoAmount,
+          status: "pendente",
+          createdAt,
+          updatedAt: createdAt,
+          paidAt: null,
+          paidMethod: null,
+          adjustments: []
+        });
+      }
     }
 
     appendComandaEvent(comanda, {
