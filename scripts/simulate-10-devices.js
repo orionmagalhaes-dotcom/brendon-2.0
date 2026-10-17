@@ -60,6 +60,10 @@ class SimulatedSupabaseHub {
     this.subscribers = [];
     this.lockCollisions = 0;
     this.totalWrites = 0;
+    this.pendingMessages = 0;
+    this.dropRate = 0;
+    this.maxDeliveryDelayMs = 8;
+    this.droppedMessages = 0;
   }
 
   subscribe(device) {
@@ -69,12 +73,33 @@ class SimulatedSupabaseHub {
   broadcast(senderDevice, event, payload) {
     for (const sub of this.subscribers) {
       if (sub.sessionId !== senderDevice.sessionId) {
+        if (!sub.online || Math.random() < this.dropRate) {
+          this.droppedMessages++;
+          continue;
+        }
         // Asynchronous message delivery simulation
+        this.pendingMessages++;
         setTimeout(() => {
-          sub.receiveRealtime(event, payload);
-        }, Math.floor(Math.random() * 8) + 2);
+          try {
+            sub.receiveRealtime(event, clone(payload));
+          } finally {
+            this.pendingMessages--;
+          }
+        }, Math.floor(Math.random() * this.maxDeliveryDelayMs) + 2);
       }
     }
+  }
+
+  async flush(devices, timeoutMs = 10000) {
+    const startedAt = Date.now();
+    let stableRounds = 0;
+    while (Date.now() - startedAt < timeoutMs) {
+      const busy = this.pendingMessages > 0 || devices.some((device) => device.online && (device.syncInFlight || device.syncQueued));
+      stableRounds = busy ? 0 : stableRounds + 1;
+      if (stableRounds >= 3) return;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    throw new Error("Timeout aguardando convergencia da simulacao.");
   }
 
   async read() {
@@ -109,6 +134,7 @@ class SimulatedDevice {
     this.sessionId = `sess_${name.toLowerCase()}_${Math.random().toString(36).slice(2, 7)}`;
     this.state = null;
     this.lastKnownRemoteUpdatedAt = null;
+    this.online = true;
     this.syncQueued = false;
     this.syncInFlight = false;
     this.stats = {
@@ -127,8 +153,32 @@ class SimulatedDevice {
     this.hub.subscribe(this);
   }
 
+  async setOnline(value) {
+    this.online = Boolean(value);
+    if (!this.online) return;
+    await this.pullState();
+    if (this.syncQueued) void this.syncLoop();
+  }
+
+  createConcurrentLogin() {
+    const sessionSuffix = this.sessionId.replace(/[^a-z0-9]/gi, "").slice(-6).toLowerCase();
+    const id = 1000000000000 + (Date.now() % 1000000000) * 1000000 + Math.floor(Math.random() * 1000000);
+    const user = {
+      id,
+      name: `Garcom Login ${this.name}`,
+      role: "waiter",
+      login: `garcom_stress_${sessionSuffix}`,
+      password: "2222",
+      active: true,
+      updatedAt: isoNow()
+    };
+    this.state.users = [...(this.state.users || []), user];
+    this.triggerSync();
+    return user;
+  }
+
   receiveRealtime(event, payload) {
-    if (!payload || payload.sessionId === this.sessionId) return;
+    if (!this.online || !payload || payload.sessionId === this.sessionId) return;
     this.stats.realtimeReceived++;
     switch (event) {
       case "comanda_upsert":
@@ -152,6 +202,9 @@ class SimulatedDevice {
   applyComandaUpsert(payload) {
     const incoming = payload.comanda;
     if (!incoming || !incoming.id) return;
+    const blocked = (this.state.closedComandas || []).some((c) => c.id === incoming.id) ||
+      (this.state.meta?.deletedComandaIds || []).includes(incoming.id);
+    if (blocked) return;
     const openRows = this.state.openComandas || [];
     const idx = openRows.findIndex((c) => c.id === incoming.id);
     if (idx >= 0) {
@@ -359,16 +412,16 @@ class SimulatedDevice {
 
   triggerSync() {
     this.syncQueued = true;
-    if (!this.syncInFlight) {
+    if (this.online && !this.syncInFlight) {
       void this.syncLoop();
     }
   }
 
   async syncLoop() {
-    if (this.syncInFlight) return;
+    if (this.syncInFlight || !this.online) return;
     this.syncInFlight = true;
 
-    while (this.syncQueued) {
+    while (this.syncQueued && this.online) {
       this.syncQueued = false;
       const remote = await this.hub.read();
       // Merge local with remote state
@@ -390,6 +443,16 @@ class SimulatedDevice {
 
   mergeStates(local, remote) {
     const result = clone(local);
+    const users = new Map();
+    for (const user of [...(local.users || []), ...(remote.users || [])]) {
+      if (!user?.id) continue;
+      const previous = users.get(String(user.id));
+      if (!previous || String(user.updatedAt || "") >= String(previous.updatedAt || "")) {
+        users.set(String(user.id), clone(user));
+      }
+    }
+    result.users = [...users.values()];
+
     // 1. Merge openComandas
     const map = new Map();
     for (const c of local.openComandas || []) {
@@ -437,6 +500,7 @@ class SimulatedDevice {
   }
 
   async pullState() {
+    if (!this.online) return;
     const remote = await this.hub.read();
     this.state = this.mergeStates(this.state, remote.payload);
     this.lastKnownRemoteUpdatedAt = remote.updated_at;
@@ -448,7 +512,7 @@ class SimulatedDevice {
 // ==========================================
 async function runSimulation() {
   console.log("===============================================================");
-  console.log("SIMULAÇÃO DE RESTAURANTE REAL COM 10 DISPOSITIVOS SIMULTÂNEOS");
+  console.log("SIMULAÇÃO MASSIVA DE RESTAURANTE COM 30 DISPOSITIVOS");
   console.log("===============================================================\n");
 
   const hub = new SimulatedSupabaseHub(productsData);
@@ -465,12 +529,27 @@ async function runSimulation() {
     new SimulatedDevice("Garcom-Beatriz", "waiter", 9, hub),
     new SimulatedDevice("Cozinha-Monitor", "cook", 10, hub)
   ];
+  for (let i = 11; i <= 30; i++) {
+    devices.push(new SimulatedDevice(`Garcom-Stress-${String(i).padStart(2, "0")}`, "waiter", i, hub));
+  }
 
-  console.log("1. Inicializando 10 dispositivos...");
+  console.log(`1. Inicializando ${devices.length} dispositivos...`);
   for (const d of devices) {
     await d.init();
   }
-  console.log("   -> 10 dispositivos conectados ao Hub com sucesso.\n");
+  console.log(`   -> ${devices.length} dispositivos conectados ao Hub com sucesso.\n`);
+
+  console.log("1b. DISPARANDO 30 LOGINS NOVOS EM PARALELO...");
+  const concurrentUsers = devices.map((device) => device.createConcurrentLogin());
+  await hub.flush(devices);
+  for (const d of devices) await d.pullState();
+
+  const cloudUserIds = new Set((hub.cloudRow.payload.users || []).map((user) => String(user.id)));
+  const cloudLogins = new Set((hub.cloudRow.payload.users || []).map((user) => String(user.login).toLowerCase()));
+  if (concurrentUsers.some((user) => !cloudUserIds.has(String(user.id))) || cloudLogins.size !== (hub.cloudRow.payload.users || []).length) {
+    throw new Error("FALHA CRITICA: logins concorrentes colidiram ou desapareceram.");
+  }
+  console.log("   -> 30 identidades distintas preservadas e sincronizadas.\n");
 
   // Pick popular test products
   const pSkol = productsData.find((p) => p.category === "Bar" && p.name.includes("SKOL")) || productsData.find((p) => p.category === "Bar");
@@ -486,6 +565,31 @@ async function runSimulation() {
   console.log(` - Espetinho: ${pEspeto.name} (${money(pEspeto.price)})`);
   console.log(` - Porção: ${pBatata.name} (${money(pBatata.price)})\n`);
 
+  console.log("1c. TESTANDO APARELHO OFFLINE E PERDA DE MENSAGENS REALTIME...");
+  const offlineDevice = devices[29];
+  await offlineDevice.setOnline(false);
+  const offlineComanda = offlineDevice.createComanda("Mesa Offline", "Cliente sem sinal");
+  const offlineItem = offlineDevice.addItemToComanda(offlineComanda.id, pBaiao, 2, "criado offline");
+  hub.dropRate = 0.35;
+  hub.maxDeliveryDelayMs = 90;
+  const recoveryComanda = devices[1].createComanda("Mesa Recuperacao", "Cliente realtime perdido");
+  const recoveryItem = devices[1].addItemToComanda(recoveryComanda.id, pSkol, 1, "recuperar por pull");
+  await hub.flush(devices);
+  await offlineDevice.setOnline(true);
+  await hub.flush(devices);
+  hub.dropRate = 0;
+  hub.maxDeliveryDelayMs = 8;
+  for (const d of devices) await d.pullState();
+  const recoveredIds = new Set((hub.cloudRow.payload.openComandas || []).map((c) => c.id));
+  if (!recoveredIds.has(offlineComanda.id) || !recoveredIds.has(recoveryComanda.id)) {
+    throw new Error("FALHA CRITICA: recuperacao offline/realtime perdeu uma comanda.");
+  }
+  const recoveredItemIds = new Set((hub.cloudRow.payload.openComandas || []).flatMap((c) => (c.items || []).map((item) => item.id)));
+  if (!recoveredItemIds.has(offlineItem.id) || !recoveredItemIds.has(recoveryItem.id)) {
+    throw new Error("FALHA CRITICA: recuperacao offline/realtime perdeu um item.");
+  }
+  console.log(`   -> Offline recuperado; ${hub.droppedMessages} mensagens realtime descartadas sem perda de dados.\n`);
+
   // STEP 1: Concurrently open 8 tables
   console.log("2. DISPARANDO ABERTURA CONCORRENTE DE COMANDAS...");
   const tables = [
@@ -498,6 +602,9 @@ async function runSimulation() {
     { devIdx: 8, table: "Mesa 07", customer: "Marcos Paulo" },
     { devIdx: 0, table: "Balcão 01", customer: "Cliente Balcão" }
   ];
+  for (let i = 10; i < devices.length; i++) {
+    tables.push({ devIdx: i, table: `Mesa ${String(i + 1).padStart(2, "0")}`, customer: `Cliente Stress ${i + 1}` });
+  }
 
   const createdComandas = [];
   await Promise.all(
@@ -509,8 +616,8 @@ async function runSimulation() {
   );
   console.log(`   -> ${createdComandas.length} comandas abertas simultaneamente.\n`);
 
-  // Wait 100ms for realtime broadcast
-  await new Promise((r) => setTimeout(r, 100));
+  await hub.flush(devices);
+  for (const d of devices) await d.pullState();
 
   // STEP 2: Consecutive concurrent additions of products to tables
   console.log("3. RODADA INTENSIVA DE PEDIDOS (MULTI-DISPOSITIVOS CONCORRENTES)...");
@@ -541,11 +648,27 @@ async function runSimulation() {
   }
 
   await Promise.all(addOperations);
-  console.log(`   -> ${addOperations.length} adições de produtos processadas em paralelo.\n`);
+  const stressItems = [];
+  for (let round = 0; round < 25; round++) {
+    for (let index = 0; index < createdComandas.length; index++) {
+      const target = createdComandas[index];
+      const device = devices[(index + round) % devices.length];
+      const product = [pSkol, pBaiao, pFrango, pEspeto, pBatata][(index + round) % 5];
+      const item = device.addItemToComanda(target.comandaId, product, (round % 3) + 1, `stress-${round}-${index}`);
+      if (!item) throw new Error(`FALHA CRITICA: ${device.name} nao encontrou ${target.comandaId} durante carga.`);
+      stressItems.push(item.id);
+    }
+  }
+  await hub.flush(devices);
+  for (const d of devices) await d.pullState();
+  console.log(`   -> ${addOperations.length + stressItems.length} adições de produtos processadas em paralelo.\n`);
 
   // STEP 3: "Enviar Pedidos" test (Cozinha only!)
   console.log("4. TESTANDO 'ENVIAR PEDIDOS' (FILTRO EXCLUSIVO PARA COZINHA)...");
   const sendResult1 = devices[1].sendKitchenOrders(cmdMesa1);
+  if (sendResult1.count <= 0) {
+    throw new Error("FALHA CRITICA: itens de cozinha adicionados concorrentemente nao chegaram ao garcom responsavel.");
+  }
   console.log(`   -> Mesa 01 enviou ${sendResult1.count} itens de Cozinha.`);
   for (const item of sendResult1.items) {
     if (item.category !== "Cozinha") {
@@ -557,7 +680,8 @@ async function runSimulation() {
   // STEP 4: Finalize comanda with MULTI-PAYMENT (Mesa 01)
   console.log("\n5. TESTANDO PAGAMENTO DIVIDIDO (MÚLTIPLAS FORMAS DE PAGAMENTO)...");
   // Wait for all syncs to settle
-  await new Promise((r) => setTimeout(r, 200));
+  await hub.flush(devices);
+  for (const d of devices) await d.pullState();
 
   const mesa1InCaixa = devices[6].state.openComandas.find((c) => c.id === cmdMesa1);
   if (!mesa1InCaixa) {
@@ -579,14 +703,23 @@ async function runSimulation() {
   ];
 
   console.log(`   -> Pagamento dividido: Dinheiro ${money(part1)} + Cartão ${money(part2)}`);
+  const staleMesa1Payload = clone(mesa1InCaixa);
   devices[6].finalizeComanda(cmdMesa1, splits);
   console.log("   -> Comanda finalizada com sucesso no Caixa!\n");
 
   // Wait 300ms for final convergence
   console.log("6. AGUARDANDO CONVERGÊNCIA TOTAL DA NUVEM E DISPOSITIVOS...");
-  await new Promise((r) => setTimeout(r, 400));
+  await hub.flush(devices);
   for (const d of devices) {
     await d.pullState();
+  }
+
+  // Entrega deliberadamente atrasada: update antigo nao pode reabrir a conta.
+  for (const d of devices) {
+    d.receiveRealtime("comanda_upsert", { sessionId: "stale-session", comanda: staleMesa1Payload });
+  }
+  if (devices.some((d) => (d.state.openComandas || []).some((c) => c.id === cmdMesa1))) {
+    throw new Error("FALHA CRITICA: evento realtime atrasado reabriu comanda finalizada.");
   }
 
   // STEP 5: VERIFICAÇÕES DE INTEGRIDADE E CONSISTÊNCIA
@@ -602,16 +735,24 @@ async function runSimulation() {
     }
   }
   if (allClosedConsistent) {
-    console.log("   ✓ [CHECK 1]: Todos os 10 dispositivos têm a comanda finalizada sincronizada!");
+    console.log(`   ✓ [CHECK 1]: Todos os ${devices.length} dispositivos têm a comanda finalizada sincronizada!`);
   }
 
   // Check 2: Check items of Mesa 01
   const closedCmd = devices[0].state.closedComandas.find((c) => c.id === cmdMesa1);
   console.log(`   ✓ [CHECK 2]: Mesa 01 fechada com ${closedCmd.items.length} itens registrados.`);
 
+  const cloudComandas = [...(hub.cloudRow.payload.openComandas || []), ...(hub.cloudRow.payload.closedComandas || [])];
+  const cloudItemIds = new Set(cloudComandas.flatMap((comanda) => (comanda.items || []).map((item) => item.id)));
+  const missingStressItems = stressItems.filter((id) => !cloudItemIds.has(id));
+  if (missingStressItems.length) {
+    throw new Error(`FALHA CRITICA: ${missingStressItems.length} itens desapareceram durante a carga concorrente.`);
+  }
+  console.log(`   ✓ [CHECK 3]: ${stressItems.length} itens da carga massiva preservados integralmente.`);
+
   // Check 3: Concurrency collisions handled
-  console.log(`   ✓ [CHECK 3]: Conflitos de escrita simultânea resolvidos pelo motor: ${hub.lockCollisions}`);
-  console.log(`   ✓ [CHECK 4]: Total de escritas bem-sucedidas na nuvem: ${hub.totalWrites}`);
+  console.log(`   ✓ [CHECK 4]: Conflitos de escrita simultânea resolvidos pelo motor: ${hub.lockCollisions}`);
+  console.log(`   ✓ [CHECK 5]: Total de escritas bem-sucedidas na nuvem: ${hub.totalWrites}`);
 
   // Summary per device
   console.log("\nRESUMO POR DISPOSITIVO:");

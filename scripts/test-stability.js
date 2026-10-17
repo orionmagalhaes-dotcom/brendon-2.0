@@ -216,6 +216,50 @@ function pickRowByTimestamp(localRow, remoteRow, options = {}) {
     return preferLocal ? localRow : remoteRow;
 }
 
+function latestKitchenItemTimestamp(item) {
+    if (!item) return 0;
+    return Math.max(
+        parseUpdatedAtTimestamp(item.updatedAt),
+        parseUpdatedAtTimestamp(item.addedAt),
+        parseUpdatedAtTimestamp(item.kitchenStatusAt),
+        parseUpdatedAtTimestamp(item.kitchenPriorityAt),
+        parseUpdatedAtTimestamp(item.kitchenReceivedAt),
+        parseUpdatedAtTimestamp(item.waiterVisualUpdatedAt),
+        parseUpdatedAtTimestamp(item.deliveredAt),
+        parseUpdatedAtTimestamp(item.canceledAt),
+        parseUpdatedAtTimestamp(item.createdAt)
+    );
+}
+
+function isComandaBlockedFromRealtimeUpsert(targetState, comanda) {
+    const id = String(comanda?.id || "").trim();
+    if (!id) return true;
+    if (normalizeDeletedIdList(targetState?.meta?.deletedComandaIds).includes(id)) return true;
+    if ((targetState?.closedComandas || []).some((row) => String(row?.id || "").trim() === id)) return true;
+    return (targetState?.history90 || []).some((closure) =>
+        (closure?.commandas || []).some((row) => String(row?.id || "").trim() === id)
+    );
+}
+
+function normalizeDuplicatePayablesForTest(rows) {
+    const groups = new Map();
+    for (const row of rows || []) {
+        const key = `${String(row?.comandaId || '').trim()}::${row?.status === 'pago' ? 'pago' : 'pendente'}`;
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key).push(row);
+    }
+    return [...groups.values()].map((group) => {
+        group.sort((a, b) => String(b?.updatedAt || b?.createdAt || '').localeCompare(String(a?.updatedAt || a?.createdAt || '')));
+        const canonical = { ...group[0] };
+        const duplicates = group.slice(1);
+        if (duplicates.length) {
+            canonical.mergedDuplicateIds = duplicates.map((row) => row.id);
+            canonical.mergedDuplicateRecords = duplicates.map((row) => ({ ...row }));
+        }
+        return canonical;
+    });
+}
+
 function mergeComandasById(localRows, remoteRows, options = {}) {
     const map = new Map();
     const allowRemoteOnly = options.allowRemoteOnly !== false;
@@ -229,16 +273,22 @@ function mergeComandasById(localRows, remoteRows, options = {}) {
         if (!id) continue;
         if (!allowRemoteOnly && !map.has(id)) continue;
         const previous = map.get(id);
-        map.set(
-            id,
-            pickRowByTimestamp(previous, comanda, {
-                getTimestamp: (row) => {
-                    const lastEventAt = Array.isArray(row?.events) && row.events.length ? row.events[row.events.length - 1]?.ts : null;
-                    return row?.closedAt || lastEventAt || row?.createdAt || "";
-                },
-                preferLocal: options.preferLocal !== false
-            })
-        );
+        const merged = pickRowByTimestamp(previous, comanda, {
+            getTimestamp: (row) => row?.updatedAt || (Array.isArray(row?.events) && row.events.length ? row.events[row.events.length - 1]?.ts : null) || row?.closedAt || row?.createdAt || "",
+            preferLocal: options.preferLocal !== false
+        });
+        if (previous && comanda && merged) {
+            const itemMap = new Map();
+            for (const item of previous.items || []) if (item?.id) itemMap.set(String(item.id), item);
+            for (const item of comanda.items || []) {
+                const itemId = String(item?.id || "");
+                if (!itemId) continue;
+                const existing = itemMap.get(itemId);
+                if (!existing || latestKitchenItemTimestamp(item) > latestKitchenItemTimestamp(existing)) itemMap.set(itemId, item);
+            }
+            merged.items = [...itemMap.values()];
+        }
+        map.set(id, merged);
     }
     return [...map.values()];
 }
@@ -650,6 +700,56 @@ section("mergeComandasById");
     // allowRemoteOnly = false
     const merged3 = mergeComandasById(local, remote, { allowRemoteOnly: false });
     assertEqual(merged3.length, 2, "allowRemoteOnly=false filtra remote-only");
+
+    const itemMerged = mergeComandasById(
+        [{ id: "CMD-I", updatedAt: "2025-06-15T12:00:00Z", items: [{ id: "IT-1", qty: 1, createdAt: "2025-06-15T10:00:00Z", updatedAt: "2025-06-15T10:00:00Z" }] }],
+        [{ id: "CMD-I", updatedAt: "2025-06-15T12:01:00Z", items: [{ id: "IT-1", qty: 3, createdAt: "2025-06-15T10:00:00Z", updatedAt: "2025-06-15T12:01:00Z" }] }]
+    );
+    assertEqual(itemMerged[0].items[0].qty, 3, "item com updatedAt mais recente prevalece no merge");
+}
+
+section("realtime fora de ordem");
+{
+    const stale = { id: "CMD-0001-OLD", updatedAt: "2026-10-17T12:00:00.000Z" };
+    assert(
+        isComandaBlockedFromRealtimeUpsert({ meta: {}, closedComandas: [{ id: stale.id }], history90: [] }, stale),
+        "update atrasado nao reabre comanda finalizada"
+    );
+    assert(
+        isComandaBlockedFromRealtimeUpsert({ meta: { deletedComandaIds: [stale.id] }, closedComandas: [], history90: [] }, stale),
+        "update atrasado nao recria comanda excluida"
+    );
+    assert(
+        isComandaBlockedFromRealtimeUpsert({ meta: {}, closedComandas: [], history90: [{ commandas: [{ id: stale.id }] }] }, stale),
+        "update atrasado nao restaura comanda arquivada no fechamento"
+    );
+    assert(
+        !isComandaBlockedFromRealtimeUpsert({ meta: {}, closedComandas: [], history90: [] }, { id: "CMD-NOVA" }),
+        "comanda nova continua aceita pelo realtime"
+    );
+}
+
+section("fiados duplicados por comanda");
+{
+    const rows = normalizeDuplicatePayablesForTest([
+        { id: "PG-1", comandaId: "CMD-1", status: "pendente", total: 17, updatedAt: "2026-10-17T10:00:00.000Z" },
+        { id: "PG-LEGACY-1", comandaId: "CMD-1", status: "pendente", total: 17, updatedAt: "2026-10-17T10:00:00.000Z" },
+        { id: "PG-2", comandaId: "CMD-2", status: "pago", total: 32, updatedAt: "2026-10-17T11:00:00.000Z" }
+    ]);
+    assertEqual(rows.length, 2, "mantem um registro por comanda e status");
+    assertEqual(rows.find((row) => row.comandaId === "CMD-1").total, 17, "nao soma clones do mesmo fiado");
+    assertEqual(rows.find((row) => row.comandaId === "CMD-1").mergedDuplicateIds.length, 1, "preserva ID do clone para auditoria");
+    assertEqual(rows.find((row) => row.comandaId === "CMD-1").mergedDuplicateRecords.length, 1, "preserva dados do clone para recuperacao");
+}
+
+function isKnownSystemTestUser(user) {
+    if (!user) return false;
+    const role = String(user.role || "").trim().toLowerCase();
+    const name = String(user.name || "").trim().toLowerCase();
+    const login = String(user.login || "").trim().toLowerCase();
+    if (role === "waiter" && name === "garcom teste" && login === "user") return true;
+    if (role === "admin" && name === "owner admin" && login === "owner") return true;
+    return false;
 }
 
 section("mergeAuditRows");
@@ -840,6 +940,13 @@ assert(hasSystemTestMarker("Cupom de Teste 123"), "detecta 'cupom de teste'");
 assert(!hasSystemTestMarker("Pizza"), "nao detecta falso positivo");
 assert(!hasSystemTestMarker(""), "string vazia nao e marcador");
 assert(!hasSystemTestMarker(null), "null nao e marcador");
+
+section("isKnownSystemTestUser");
+assert(
+    !isKnownSystemTestUser({ role: "waiter", name: "Garcom Codigo 003", login: "garcom_003_abc123" }),
+    "garcom real criado pelo codigo 2222 nao e removido como usuario de teste"
+);
+assert(isKnownSystemTestUser({ role: "waiter", name: "Garcom Teste", login: "user" }), "usuario de teste legado ainda e identificado");
 
 section("sortByRowIdAsc");
 {

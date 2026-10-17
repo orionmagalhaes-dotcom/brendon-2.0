@@ -148,19 +148,13 @@
   });
 
   function debugReport(hypothesisId, location, msg, data = {}, runId = "pre-fix") {
-    fetch("http://127.0.0.1:7777/event", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        sessionId: "cross-device-sync",
-        runId,
-        hypothesisId,
-        location,
-        msg: `[DEBUG] ${msg}`,
-        data,
-        ts: Date.now()
-      })
-    }).catch(() => { });
+    // Mantido como ponto de instrumentacao local, sem transmitir credenciais
+    // ou estado operacional em producao.
+    void hypothesisId;
+    void location;
+    void msg;
+    void data;
+    void runId;
   }
 
   function isAdminOrDev(userOrRole) {
@@ -287,7 +281,6 @@
   }
 
   function sanitizeOperationalComandasAgainstHistory(targetState) {
-    console.log("[sanitizeOperationalComandasAgainstHistory] Starting, targetState.openComandas count:", targetState.openComandas?.length);
     if (!targetState || typeof targetState !== "object") return;
     targetState.history90 = sanitizeHistoryClosuresByCashWindow(targetState.history90);
     const archivedIds = new Set(
@@ -296,30 +289,23 @@
         .map((comanda) => String(comanda?.id || "").trim())
         .filter(Boolean)
     );
-    console.log("[sanitizeOperationalComandasAgainstHistory] archivedIds:", Array.from(archivedIds));
     const closedComandas = dedupeComandasById(targetState.closedComandas).filter(
       (comanda) => !archivedIds.has(String(comanda?.id || "").trim())
     );
-    console.log("[sanitizeOperationalComandasAgainstHistory] closedComandas after filter:", closedComandas);
     const closedIds = new Set(closedComandas.map((comanda) => String(comanda?.id || "").trim()).filter(Boolean));
-    console.log("[sanitizeOperationalComandasAgainstHistory] closedIds:", Array.from(closedIds));
     const openComandas = dedupeComandasById(targetState.openComandas).filter((comanda) => {
       const id = String(comanda?.id || "").trim();
       if (!id) {
-        console.log("[sanitizeOperationalComandasAgainstHistory] Filtering out comanda with no id:", comanda);
         return false;
       }
       if (archivedIds.has(id)) {
-        console.log("[sanitizeOperationalComandasAgainstHistory] Filtering out comanda (in archivedIds):", id);
         return false;
       }
       if (closedIds.has(id)) {
-        console.log("[sanitizeOperationalComandasAgainstHistory] Filtering out comanda (in closedIds):", id);
         return false;
       }
       return true;
     });
-    console.log("[sanitizeOperationalComandasAgainstHistory] Final openComandas:", openComandas);
     targetState.closedComandas = closedComandas;
     targetState.openComandas = openComandas;
     synchronizeCashOpenedAt(targetState);
@@ -347,6 +333,29 @@
       const comandaTs = comandaReferenceTimestamp(comanda);
       return Boolean(comandaTs && comandaTs > closedTs);
     });
+  }
+
+  function isComandaDeleted(comandaId) {
+    const id = String(comandaId || "").trim();
+    if (!id) return false;
+    return normalizeDeletedIdList(state?.meta?.deletedComandaIds).includes(id);
+  }
+
+  function isComandaAlreadyClosed(comandaId) {
+    const id = String(comandaId || "").trim();
+    if (!id) return false;
+    if ((state.closedComandas || []).some((row) => String(row?.id || "").trim() === id)) return true;
+    return (state.history90 || []).some((closure) =>
+      (closure?.commandas || []).some((row) => String(row?.id || "").trim() === id)
+    );
+  }
+
+  // Broadcasts podem chegar fora de ordem. Uma atualizacao antiga nunca pode
+  // reabrir uma comanda que este aparelho ja sabe que foi fechada ou excluida.
+  function isComandaBlockedFromRealtimeUpsert(comanda) {
+    const id = String(comanda?.id || "").trim();
+    if (!id) return true;
+    return isComandaDeleted(id) || isComandaAlreadyClosed(id) || isIncomingComandaFromClosedCash(comanda);
   }
 
   function comandaNumericPart(comandaId) {
@@ -437,6 +446,51 @@
     return `IT-${String(seq).padStart(5, "0")}-${sessionChunk}${timeChunk}${randomChunk}`;
   }
 
+  function generateUniqueSaleId(targetState = state, prefix = "AV") {
+    targetState.seq = targetState.seq || {};
+    const reservedIds = collectComandaIdsFromState(targetState);
+    const sessionChunk = (String(clientSessionId || "").replace(/[^a-z0-9]/gi, "").slice(-4) || "SESS").toUpperCase();
+    for (let attempt = 0; attempt < 1000; attempt += 1) {
+      const seq = Number(targetState.seq.sale || 1);
+      targetState.seq.sale = seq + 1;
+      const candidate = `${prefix}-${String(seq).padStart(5, "0")}-${sessionChunk}${Date.now().toString(36).slice(-4).toUpperCase()}${Math.random().toString(36).slice(2, 4).toUpperCase()}`;
+      if (!reservedIds.has(candidate)) return candidate;
+    }
+    return `${prefix}-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).slice(2, 10).toUpperCase()}`;
+  }
+
+  function generateUniqueEventId(targetState = state) {
+    targetState.seq = targetState.seq || {};
+    const eventSeq = Number(targetState.seq.event || 1);
+    targetState.seq.event = eventSeq + 1;
+    const sessionChunk = (String(clientSessionId || "sess").replace(/[^a-z0-9]/gi, "").slice(-6) || "SESS").toUpperCase();
+    return `EV-${eventSeq}-${sessionChunk}-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).slice(2, 5).toUpperCase()}`;
+  }
+
+  function generateUniqueUserId(targetState = state) {
+    const usedIds = new Set((targetState.users || []).map((user) => Number(user?.id || 0)).filter(Number.isSafeInteger));
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      let entropy = Math.floor(Math.random() * 1000000);
+      if (typeof crypto !== "undefined" && typeof crypto.getRandomValues === "function") {
+        const values = new Uint32Array(1);
+        crypto.getRandomValues(values);
+        entropy = values[0] % 1000000;
+      }
+      const candidate = 1000000000000 + (Date.now() % 1000000000) * 1000000 + entropy;
+      if (Number.isSafeInteger(candidate) && !usedIds.has(candidate)) return candidate;
+    }
+    return Math.max(1, Number(targetState.seq?.user || 1));
+  }
+
+  function generateUniqueProductId(targetState = state) {
+    const usedIds = new Set((targetState.products || []).map((product) => Number(product?.id || 0)).filter(Number.isSafeInteger));
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const candidate = 1000000000 + Math.floor(Math.random() * 1000000000);
+      if (!usedIds.has(candidate)) return candidate;
+    }
+    return Math.max(1, Number(targetState.seq?.product || 1));
+  }
+
   function generateUniquePayableId(targetState) {
     const rows = Array.isArray(targetState?.payables) ? targetState.payables : [];
     const usedIds = new Set(rows.map((row) => String(row?.id || "").trim()).filter(Boolean));
@@ -450,25 +504,73 @@
     return `PG-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 16)}`;
   }
 
-  function normalizeDuplicatePayableIds(targetState) {
+  function payableTimestamp(payable) {
+    return parseUpdatedAtTimestamp(payable?.updatedAt || payable?.paidAt || payable?.createdAt || "");
+  }
+
+  // Um fechamento de comanda deve gerar no maximo um fiado por comanda/status.
+  // Versoes antigas criavam IDs diferentes durante retries e deixavam clones
+  // do mesmo lancamento. Consolidamos sem somar clones, preservando a origem
+  // em mergedDuplicateRecords para auditoria e eventual recuperacao manual.
+  function normalizeDuplicatePayables(targetState) {
     if (!targetState || !Array.isArray(targetState.payables)) return false;
-    const usedIds = new Set();
+    const groups = new Map();
     let changed = false;
-    targetState.payables = targetState.payables.map((payable, index) => {
-      const originalId = String(payable?.id || "").trim() || `PG-LEGACY-${index + 1}`;
-      if (!usedIds.has(originalId)) {
-        usedIds.add(originalId);
-        return payable;
+    for (const payable of targetState.payables) {
+      if (!payable || typeof payable !== "object") continue;
+      const comandaId = String(payable.comandaId || "").trim();
+      const status = payable.status === "pago" ? "pago" : "pendente";
+      const key = comandaId ? `${comandaId}::${status}` : `id::${String(payable.id || "")}`;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(payable);
+    }
+    const normalized = [];
+    for (const rows of groups.values()) {
+      rows.sort((a, b) => {
+        const timeDiff = payableTimestamp(b) - payableTimestamp(a);
+        if (timeDiff) return timeDiff;
+        const aLegacy = String(a?.id || "").startsWith("PG-LEGACY-") ? 1 : 0;
+        const bLegacy = String(b?.id || "").startsWith("PG-LEGACY-") ? 1 : 0;
+        return aLegacy - bLegacy || String(a?.id || "").localeCompare(String(b?.id || ""));
+      });
+      const canonical = { ...rows[0] };
+      const duplicateRows = rows.slice(1);
+      const priorDuplicates = Array.isArray(canonical.mergedDuplicateRecords) ? canonical.mergedDuplicateRecords : [];
+      const mergedRecords = [...priorDuplicates, ...duplicateRows]
+        .flatMap((entry) => {
+          const copy = { ...entry };
+          delete copy.mergedDuplicateRecords;
+          return [copy];
+        });
+      const seenRecordIds = new Set();
+      canonical.mergedDuplicateRecords = mergedRecords.filter((entry) => {
+        const id = String(entry?.id || "").trim();
+        if (!id || seenRecordIds.has(id) || id === String(canonical.id || "")) return false;
+        seenRecordIds.add(id);
+        return true;
+      });
+      if (!canonical.mergedDuplicateRecords.length) delete canonical.mergedDuplicateRecords;
+      const duplicateIds = [...new Set([
+        ...(Array.isArray(canonical.mergedDuplicateIds) ? canonical.mergedDuplicateIds : []),
+        ...duplicateRows.map((row) => String(row?.id || "").trim()).filter(Boolean)
+      ])].filter((id) => id && id !== String(canonical.id || ""));
+      if (duplicateIds.length) canonical.mergedDuplicateIds = duplicateIds;
+      if (duplicateRows.length) {
+        canonical.duplicateRecordCount = duplicateIds.length;
+        canonical.duplicateConflict = duplicateRows.some((row) =>
+          Number(row?.total || 0) !== Number(canonical.total || 0) || String(row?.status || "") !== String(canonical.status || "")
+        );
+        changed = true;
       }
-      const base = String(payable?.comandaId || payable?.createdAt || index + 1).replace(/[^a-zA-Z0-9]/g, "").slice(-36) || String(index + 1);
-      let candidate = `PG-LEGACY-${base}`;
-      let suffix = 2;
-      while (usedIds.has(candidate)) candidate = `PG-LEGACY-${base}-${suffix++}`;
-      usedIds.add(candidate);
-      changed = true;
-      return { ...payable, id: candidate };
-    });
+      normalized.push(canonical);
+    }
+    if (normalized.length !== targetState.payables.length) changed = true;
+    targetState.payables = normalized;
     return changed;
+  }
+
+  function normalizeDuplicatePayableIds(targetState) {
+    return normalizeDuplicatePayables(targetState);
   }
 
   function browserNameFromUa(uaRaw) {
@@ -833,6 +935,8 @@
   function latestKitchenItemTimestamp(item) {
     if (!item) return 0;
     return Math.max(
+      parseUpdatedAtTimestamp(item.updatedAt),
+      parseUpdatedAtTimestamp(item.addedAt),
       parseUpdatedAtTimestamp(item.kitchenStatusAt),
       parseUpdatedAtTimestamp(item.kitchenPriorityAt),
       parseUpdatedAtTimestamp(item.kitchenReceivedAt),
@@ -922,7 +1026,7 @@
       map.set(key, pickRowByTimestamp(map.get(key), row, options));
     }
     const mergedState = { payables: [...map.values()] };
-    normalizeDuplicatePayableIds(mergedState);
+    normalizeDuplicatePayables(mergedState);
     return mergedState.payables;
   }
 
@@ -1056,7 +1160,6 @@
   }
 
   function mergeStateForCloud(localState, remoteState) {
-    console.log("[mergeStateForCloud] Starting, local openComandas count:", localState.openComandas?.length, "remote openComandas count:", remoteState.openComandas?.length);
     const localMeta = localState?.meta || {};
     const remoteMeta = remoteState?.meta || {};
     const localUpdated = parseUpdatedAtTimestamp(localMeta.updatedAt);
@@ -1083,7 +1186,7 @@
       ...(Array.isArray(remoteMeta.deletedComandaIds) ? remoteMeta.deletedComandaIds : [])
     ]);
     // #region debug-point B:merge-input
-    debugReport("B", "app.js:mergeStateForCloud", "Entrando no merge", {
+    false && debugReport("B", "app.js:mergeStateForCloud", "Entrando no merge", {
       preferLocal,
       localMetaUpdatedAt: localMeta.updatedAt || "",
       remoteMetaUpdatedAt: remoteMeta.updatedAt || "",
@@ -1106,7 +1209,6 @@
       deletedComandaIds
     });
     // #endregion
-    console.log("[mergeStateForCloud] deletedComandaIds:", deletedComandaIds);
     const deletedComandaSet = new Set(deletedComandaIds);
     const deletedProductIds = sanitizeDeletedProductIds(deletedProductIdsRaw, localState, remoteState);
     const deletedUserIds = sanitizeDeletedUserIds(deletedUserIdsRaw, localState, remoteState);
@@ -1119,17 +1221,13 @@
       allowRemoteOnly: allowRemoteOperationalInsert,
       deletedIds: deletedComandaIds
     });
-    console.log("[mergeStateForCloud] mergedOpenComandasRaw count:", mergedOpenComandasRaw?.length);
     const mergedClosedComandas = mergeComandasById(localState?.closedComandas, remoteState?.closedComandas, {
       preferLocal,
       allowRemoteOnly: allowRemoteOperationalInsert,
       deletedIds: deletedComandaIds
     });
-    console.log("[mergeStateForCloud] mergedClosedComandas count:", mergedClosedComandas?.length);
     const closedIds = new Set(mergedClosedComandas.map((comanda) => String(comanda?.id || "").trim()).filter(Boolean));
-    console.log("[mergeStateForCloud] closedIds:", Array.from(closedIds));
     const mergedOpenComandas = mergedOpenComandasRaw.filter((comanda) => !closedIds.has(String(comanda?.id || "").trim()));
-    console.log("[mergeStateForCloud] mergedOpenComandas count after closedIds filter:", mergedOpenComandas?.length);
     const mergedHistory90 = mergeRowsByIdWithTimestamp(localState?.history90, remoteState?.history90, {
       getTimestamp: (row) => row?.closedAt || row?.createdAt || row?.updatedAt || "",
       preferLocal,
@@ -1176,7 +1274,7 @@
     });
     const mergedUsers = mergedUsersRaw.filter((u) => !deletedUserIds.includes(String(u?.id ?? "").trim()));
     // #region debug-point B:merge-output
-    debugReport("B", "app.js:mergeStateForCloud", "Saindo do merge", {
+    false && debugReport("B", "app.js:mergeStateForCloud", "Saindo do merge", {
       mergedUsers: mergedUsers.map((u) => ({
         id: u?.id,
         login: u?.login,
@@ -1231,20 +1329,15 @@
         return { ...(preferLocal ? remoteCash : localCash), ...(preferLocal ? localCash : remoteCash) };
       })()
     };
-    console.log("[mergeStateForCloud] After building merged object, merged.openComandas count:", merged.openComandas?.length);
     applyOperationalResetCutoff(merged, operationalResetAt);
-    console.log("[mergeStateForCloud] After applyOperationalResetCutoff, merged.openComandas count:", merged.openComandas?.length);
     applyRealtimeAuditCutoff(merged, realtimeAuditResetAt);
-    console.log("[mergeStateForCloud] After applyRealtimeAuditCutoff, merged.openComandas count:", merged.openComandas?.length);
     sanitizeOperationalComandasAgainstHistory(merged);
-    console.log("[mergeStateForCloud] After sanitizeOperationalComandasAgainstHistory, merged.openComandas count:", merged.openComandas?.length);
     merged.seq = merged.seq || {};
     const maxUserId = Math.max(0, ...(Array.isArray(merged.users) ? merged.users : []).map((u) => Number(u?.id || 0)));
     const maxProductId = Math.max(0, ...(Array.isArray(merged.products) ? merged.products : []).map((p) => Number(p?.id || 0)));
     merged.seq.user = Math.max(Number(merged.seq.user || 0), maxUserId + 1);
     merged.seq.product = Math.max(Number(merged.seq.product || 0), maxProductId + 1);
     recomputeComandaSequence(merged);
-    console.log("[mergeStateForCloud] Final merged.openComandas count:", merged.openComandas?.length);
     return merged;
   }
 
@@ -2592,19 +2685,11 @@
     return SYSTEM_TEST_MARKERS.some((marker) => text.includes(marker));
   }
 
-  function isSystemGeneratedCodeWaiter(user) {
-    if (!user || user.role !== "waiter") return false;
-    const name = String(user.name || "").trim();
-    const login = String(user.login || "").trim().toLowerCase();
-    return name.startsWith(`${ACCESS_CODE_WAITER_PREFIX} `) && login.startsWith("garcom_");
-  }
-
   function isKnownSystemTestUser(user) {
     if (!user) return false;
     const role = String(user.role || "").trim().toLowerCase();
     const name = String(user.name || "").trim().toLowerCase();
     const login = String(user.login || "").trim().toLowerCase();
-    if (isSystemGeneratedCodeWaiter(user)) return true;
     if (role === "waiter" && name === "garcom teste" && login === "user") return true;
     if (role === "admin" && name === "owner admin" && login === "owner") return true;
     return false;
@@ -2616,7 +2701,6 @@
     const actorName = String(entry.actorName || "");
     const type = String(entry.type || "");
     if (hasSystemTestMarker(detail) || hasSystemTestMarker(actorName)) return true;
-    if (type === "funcionario_add" && detail.includes("criado automaticamente via codigo 2222")) return true;
     return false;
   }
 
@@ -3029,7 +3113,6 @@
   }
 
   function normalizeStateShape(source) {
-    console.log("[normalizeStateShape] Starting with source, openComandas count:", source.openComandas?.length);
     const parsed = source && typeof source === "object" ? source : {};
     const fallback = initialState();
     const deletedProductIdsRaw = normalizeDeletedIdList(parsed.meta?.deletedProductIds);
@@ -3096,13 +3179,11 @@
       session: { userId: parsed.session?.userId || null }
     };
     normalizeDuplicatePayableIds(normalized);
-    console.log("[normalizeStateShape] After initial normalization, openComandas count:", normalized.openComandas?.length);
     normalized.meta.deletedUserIds = sanitizeDeletedUserIds(normalized.meta.deletedUserIds, normalized);
     normalized.meta.deletedProductIds = sanitizeDeletedProductIds(normalized.meta.deletedProductIds, normalized);
 
     ensureSystemUsers(normalized);
     const recovered = applyCatalogBackupRecovery(normalized);
-    console.log("[normalizeStateShape] After applyCatalogBackupRecovery, openComandas count:", recovered.openComandas?.length);
     recovered.seq = recovered.seq || normalized.seq || {};
     recovered.meta = recovered.meta || {};
     recovered.meta.deletedUserIds = sanitizeDeletedUserIds(recovered.meta.deletedUserIds, normalized, recovered);
@@ -3111,13 +3192,9 @@
     applyEduardoCredentialRecovery(recovered);
     purgeSystemTestArtifacts(recovered);
     applyFinalClientPreparation(recovered);
-    console.log("[normalizeStateShape] Before applyOperationalResetCutoff, openComandas count:", recovered.openComandas?.length);
     applyOperationalResetCutoff(recovered, recovered.meta?.operationalResetAt);
-    console.log("[normalizeStateShape] After applyOperationalResetCutoff, openComandas count:", recovered.openComandas?.length);
     applyRealtimeAuditCutoff(recovered, recovered.meta?.realtimeAuditResetAt);
-    console.log("[normalizeStateShape] Before sanitizeOperationalComandasAgainstHistory, openComandas count:", recovered.openComandas?.length);
     sanitizeOperationalComandasAgainstHistory(recovered);
-    console.log("[normalizeStateShape] After sanitizeOperationalComandasAgainstHistory, openComandas count:", recovered.openComandas?.length);
     recomputeComandaSequence(recovered);
     ensureCatalogBackup(recovered, "normalize");
     pruneHistory(recovered);
@@ -3125,15 +3202,12 @@
     pruneCashHtmlReports(recovered);
     pruneInternalCashAudits(recovered);
     pruneFinanceCycleReports(recovered);
-    console.log("[normalizeStateShape] Final openComandas count:", recovered.openComandas?.length);
     return recovered;
   }
 
   function loadState() {
-    console.log("[loadState] Starting load");
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) {
-      console.log("[loadState] No existing state found, using initial");
       const first = initialState();
       localStorage.setItem(STORAGE_KEY, JSON.stringify(first));
       return first;
@@ -3141,11 +3215,7 @@
 
     try {
       const parsed = JSON.parse(raw);
-      console.log("[loadState] Loaded from localStorage, openComandas count:", parsed.openComandas?.length);
-      console.log("[loadState] Loaded from localStorage, parsed.openComandas:", parsed.openComandas);
       const merged = normalizeStateShape(parsed);
-      console.log("[loadState] After normalizeStateShape, openComandas count:", merged.openComandas?.length);
-      console.log("[loadState] After normalizeStateShape, merged.openComandas:", merged.openComandas);
       localStorage.setItem(STORAGE_KEY, JSON.stringify(merged));
       return merged;
     } catch (_err) {
@@ -3278,6 +3348,8 @@
     syncQueued: false,
     reconnectTimer: null,
     reconnectAttempts: 0,
+    connecting: false,
+    backupInterval: null,
     syncRetryCount: 0,
     pullDebounceTimer: null,
     pullInFlight: false,
@@ -3321,8 +3393,16 @@
     return fingerprint;
   }
 
-  function finalizeSuccessfulCloudSync(source, remoteUpdatedAtValue) {
+  function finalizeSuccessfulCloudSync(source, remoteUpdatedAtValue, syncBaseVersion = stateVersion) {
     lastPushAt = Date.now();
+    // O estado enviado ja e o resultado do merge local/remoto. Mantemos o
+    // proprio aparelho alinhado com exatamente aquilo que foi confirmado.
+    // Se houve nova acao durante o request, ela entra novamente no merge e
+    // fica enfileirada para o proximo push, sem ser sobrescrita pela resposta.
+    const changedDuringSync = stateVersion !== syncBaseVersion;
+    const nextLocalState = changedDuringSync ? mergeStateForCloud(state, source) : source;
+    adoptIncomingState(nextLocalState);
+    if (changedDuringSync) supabaseCtx.syncQueued = true;
     state.meta = state.meta || {};
     state.meta.lastCloudSyncAt = isoNow();
     stateVersion++;
@@ -3507,6 +3587,7 @@
     const incoming = payload.comanda;
     const comandaId = String(incoming?.id || payload.comandaId || "").trim();
     if (!comandaId) return false;
+    if (isComandaDeleted(comandaId)) return false;
     if (incoming && isIncomingComandaFromClosedCash(incoming)) return false;
 
     state.openComandas = (Array.isArray(state.openComandas) ? state.openComandas : []).filter(c => String(c?.id || "").trim() !== comandaId);
@@ -3634,7 +3715,7 @@
     const incoming = payload.comanda;
     const comandaId = String(incoming?.id || "").trim();
     if (!comandaId || !Array.isArray(incoming?.items)) return false;
-    if (isIncomingComandaFromClosedCash(incoming)) return false;
+    if (isComandaBlockedFromRealtimeUpsert(incoming)) return false;
     const incomingHasKitchenOrder = incoming.items.some((item) => itemNeedsKitchen(item) && !item?.canceled);
     if (!incomingHasKitchenOrder) return false;
 
@@ -3660,7 +3741,7 @@
     const incoming = payload.comanda;
     const comandaId = String(incoming?.id || "").trim();
     if (!comandaId) return false;
-    if (isIncomingComandaFromClosedCash(incoming)) return false;
+    if (isComandaBlockedFromRealtimeUpsert(incoming)) return false;
 
     const openRows = Array.isArray(state.openComandas) ? state.openComandas : [];
     const existingIndex = openRows.findIndex((comanda) => String(comanda?.id || "").trim() === comandaId);
@@ -3686,7 +3767,7 @@
     try {
       const currentSession = sessionUserId;
       // #region debug-point C:adopt-before
-      debugReport("C", "app.js:adoptIncomingState", "Adotando estado remoto", {
+      false && debugReport("C", "app.js:adoptIncomingState", "Adotando estado remoto", {
         currentUsers: (Array.isArray(state?.users) ? state.users : []).map((u) => ({
           id: u?.id,
           login: u?.login,
@@ -3710,7 +3791,7 @@
       sessionUserId = currentSession;
       stateVersion++;
       // #region debug-point C:adopt-after
-      debugReport("C", "app.js:adoptIncomingState", "Estado adotado e normalizado", {
+      false && debugReport("C", "app.js:adoptIncomingState", "Estado adotado e normalizado", {
         users: (Array.isArray(state?.users) ? state.users : []).map((u) => ({
           id: u?.id,
           login: u?.login,
@@ -3732,6 +3813,7 @@
     const touchMeta = options.touchMeta !== false;
     state.meta = state.meta || {};
     sanitizeOperationalComandasAgainstHistory(state);
+    normalizeDuplicatePayables(state);
     synchronizeCashOpenedAt(state);
     rollFinance30DayCycles(state, { nowIso: isoNow() });
     ensureCatalogBackup(state, "save");
@@ -3841,6 +3923,7 @@
 
     supabaseCtx.syncInFlight = true;
     supabaseCtx.syncQueued = false;
+    const syncBaseVersion = stateVersion;
     ensureCatalogBackup(state, "sync");
     const sanitized = sanitizeStateForCloud(state);
     const localFingerprint = cloudStateFingerprint(sanitized);
@@ -3855,7 +3938,7 @@
     }
     try {
       // #region debug-point E:sync-start
-      debugReport("E", "app.js:syncStateToSupabase", "Iniciando sync", {
+      false && debugReport("E", "app.js:syncStateToSupabase", "Iniciando sync", {
         localMetaUpdatedAt: sanitized?.meta?.updatedAt || "",
         users: (Array.isArray(sanitized?.users) ? sanitized.users : []).map((u) => ({
           id: u?.id,
@@ -3882,7 +3965,7 @@
       }
       if (remoteData?.payload && typeof remoteData.payload === "object") {
         // #region debug-point E:sync-remote-read
-        debugReport("E", "app.js:syncStateToSupabase", "Estado remoto lido antes do write", {
+        false && debugReport("E", "app.js:syncStateToSupabase", "Estado remoto lido antes do write", {
           remoteUpdatedAt: remoteData?.updated_at || "",
           remoteMetaUpdatedAt: remoteData?.payload?.meta?.updatedAt || "",
           remoteUsers: (Array.isArray(remoteData?.payload?.users) ? remoteData.payload.users : []).map((u) => ({
@@ -3899,7 +3982,7 @@
       mergedForCloud = applyCatalogBackupRecovery(mergedForCloud, sanitized, remoteData?.payload || null);
       ensureCatalogBackup(mergedForCloud, "sync");
       if (remoteData?.payload && typeof remoteData.payload === "object" && areCloudStatesEquivalent(mergedForCloud, remoteData.payload)) {
-        finalizeSuccessfulCloudSync(mergedForCloud, remoteData.updated_at);
+        finalizeSuccessfulCloudSync(mergedForCloud, remoteData.updated_at, syncBaseVersion);
         clearPendingStateChangeBroadcast();
         return;
       }
@@ -3931,9 +4014,9 @@
         supabaseCtx.syncQueued = true;
         return;
       }
-      finalizeSuccessfulCloudSync(payload.payload, writtenUpdatedAt || payload.updated_at);
+      finalizeSuccessfulCloudSync(payload.payload, writtenUpdatedAt || payload.updated_at, syncBaseVersion);
       // #region debug-point E:sync-write-success
-      debugReport("E", "app.js:syncStateToSupabase", "Sync concluido com sucesso", {
+      false && debugReport("E", "app.js:syncStateToSupabase", "Sync concluido com sucesso", {
         writtenUpdatedAt: writtenUpdatedAt || payload.updated_at,
         payloadMetaUpdatedAt: payload?.payload?.meta?.updatedAt || "",
         users: (Array.isArray(payload?.payload?.users) ? payload.payload.users : []).map((u) => ({
@@ -3948,7 +4031,7 @@
       publishSupabaseStateChange(writtenUpdatedAt || payload.updated_at);
     } catch (err) {
       // #region debug-point E:sync-error
-      debugReport("E", "app.js:syncStateToSupabase", "Erro no sync", {
+      false && debugReport("E", "app.js:syncStateToSupabase", "Erro no sync", {
         error: String(err?.message || err || ""),
         localMetaUpdatedAt: sanitized?.meta?.updatedAt || ""
       });
@@ -4066,14 +4149,14 @@
   }
 
   function startAutoBackupInterval() {
-    setInterval(() => {
+    if (supabaseCtx.backupInterval) return;
+    supabaseCtx.backupInterval = setInterval(() => {
       void pushBackupToSupabase("auto-6h");
     }, BACKUP_AUTO_INTERVAL_MS);
     console.log("[backup] Backup automatico agendado a cada 6h.");
   }
 
   async function pullStateFromSupabase() {
-    console.log("[pullStateFromSupabase] Starting, current local openComandas count:", state.openComandas?.length);
     const client = getSupabaseClient();
     if (!client) return;
     if (supabaseCtx.pullInFlight) {
@@ -4086,16 +4169,13 @@
     try {
       const { data, error } = await client.from("restobar_state").select("payload,updated_at").eq("id", "main").maybeSingle();
       if (error || !data?.payload) {
-        console.log("[pullStateFromSupabase] No data or error, returning", error);
         return;
       }
       if (typeof data.payload !== "object" || Array.isArray(data.payload)) {
         console.warn("[pullStateFromSupabase] Payload remoto invalido, ignorando.");
         return;
       }
-      if (data?.updated_at) {
-        rememberKnownRemoteUpdatedAt(data.updated_at);
-      }
+      if (data?.updated_at) rememberObservedRemoteUpdatedAt(data.updated_at);
 
       const localUpdated = parseUpdatedAtTimestamp(state.meta?.updatedAt);
       const remoteMetaUpdated = parseUpdatedAtTimestamp(data.payload?.meta?.updatedAt);
@@ -4104,7 +4184,7 @@
       const localFootprint = stateFootprint(state);
       const remoteFootprint = stateFootprint(data.payload);
       // #region debug-point D:pull-read
-      debugReport("D", "app.js:pullStateFromSupabase", "Estado remoto recebido", {
+      false && debugReport("D", "app.js:pullStateFromSupabase", "Estado remoto recebido", {
         remoteUpdatedAt: data?.updated_at || "",
         remoteMetaUpdatedAt: data?.payload?.meta?.updatedAt || "",
         localMetaUpdatedAt: state?.meta?.updatedAt || "",
@@ -4129,8 +4209,6 @@
         }
       });
       // #endregion
-      console.log("[pullStateFromSupabase] remoteFootprint.openComandas:", remoteFootprint.openComandas);
-      console.log("[pullStateFromSupabase] data.payload.openComandas:", data.payload.openComandas);
       const localLooksReset = isLikelyResetState(state);
       const remoteHasMoreData =
         remoteFootprint.catalogRows > localFootprint.catalogRows ||
@@ -4138,25 +4216,21 @@
       const areEquivalent = areCloudStatesEquivalent(state, data.payload);
       const isKnownSameVersion = Boolean(data.updated_at && data.updated_at === supabaseCtx.lastKnownRemoteUpdatedAt);
       const shouldPull = !areEquivalent || !isKnownSameVersion || (Number.isFinite(remoteUpdated) && remoteUpdated > localUpdated) || (localLooksReset && remoteHasMoreData);
-      console.log("[pullStateFromSupabase] shouldPull:", shouldPull, "remoteUpdated:", remoteUpdated, "localUpdated:", localUpdated);
       if (shouldPull) {
         if (shouldForceRemotePreference(data.payload, state)) {
           setSupabaseStatus("aviso", "Pull remoto ignorado para evitar sobrescrita destrutiva do historico local.");
           return;
         }
-        console.log("[pullStateFromSupabase] Merging states");
         const incomingMerged = mergeStateForCloud(state, data.payload);
-        console.log("[pullStateFromSupabase] After mergeStateForCloud, incomingMerged.openComandas count:", incomingMerged.openComandas?.length);
         const incomingRecovered = applyCatalogBackupRecovery(incomingMerged, state, data.payload);
         ensureCatalogBackup(incomingRecovered, "pull");
         adoptIncomingState(incomingRecovered);
-        console.log("[pullStateFromSupabase] After adoptIncomingState, state.openComandas count:", state.openComandas?.length);
         state.meta.lastCloudSyncAt = isoNow();
         saveState({ skipCloud: true, touchMeta: false });
         render();
       }
       // #region debug-point D:pull-finish
-      debugReport("D", "app.js:pullStateFromSupabase", "Pull finalizado", {
+      false && debugReport("D", "app.js:pullStateFromSupabase", "Pull finalizado", {
         shouldPull,
         stateUsers: (Array.isArray(state?.users) ? state.users : []).map((u) => ({
           id: u?.id,
@@ -4172,6 +4246,9 @@
       if (areCloudStatesEquivalent(state, data.payload)) {
         rememberSyncedCloudFingerprint(state);
       }
+      // So confirma a versao depois que ela foi comparada e, quando
+      // necessario, incorporada. Em caso de erro o polling tentara de novo.
+      rememberKnownRemoteUpdatedAt(data.updated_at);
       setSupabaseStatus("conectado");
     } catch (err) {
       console.error("[pullStateFromSupabase] Error:", err);
@@ -4295,12 +4372,15 @@
   }
 
   async function connectSupabase() {
-    const client = getSupabaseClient();
-    if (!client) {
-      uiState.initialCloudLoadComplete = true;
-      render();
-      return;
-    }
+    if (supabaseCtx.connecting) return;
+    supabaseCtx.connecting = true;
+    try {
+      const client = getSupabaseClient();
+      if (!client) {
+        uiState.initialCloudLoadComplete = true;
+        render();
+        return;
+      }
 
     // Set a timeout to mark load complete even if Supabase is unavailable
     const loadTimeout = setTimeout(() => {
@@ -4377,6 +4457,13 @@
     scheduleSupabaseSync();
     // Inicia backup automatico a cada 6h apos a conexao inicial
     startAutoBackupInterval();
+    } catch (err) {
+      supabaseCtx.connected = false;
+      setSupabaseStatus("aviso", String(err?.message || err || "Falha ao conectar ao realtime."));
+      scheduleSupabaseReconnect(2000);
+    } finally {
+      supabaseCtx.connecting = false;
+    }
   }
 
   function getCurrentUser() {
@@ -4396,10 +4483,10 @@
   function createWaiterFromRoleAccessCode() {
     state.users = Array.isArray(state.users) ? state.users : [];
     state.seq = state.seq || {};
-    const maxId = Math.max(0, ...state.users.map((user) => Number(user?.id || 0)));
-    const nextId = Math.max(maxId + 1, Number(state.seq.user || 0) || 0);
-    const serial = String(nextId).padStart(3, "0");
-    let loginBase = `garcom_${serial}`;
+    const nextId = generateUniqueUserId(state);
+    const sessionSuffix = String(clientSessionId || "sess").replace(/[^a-z0-9]/gi, "").slice(-6).toLowerCase() || "sess";
+    const serial = String(state.users.filter((user) => user?.role === "waiter").length + 1).padStart(3, "0");
+    let loginBase = `garcom_${serial}_${sessionSuffix}`;
     let loginValue = loginBase;
     let suffix = 2;
     const existingLogins = new Set(state.users.map((user) => String(user?.login || "").trim().toLowerCase()).filter(Boolean));
@@ -4413,7 +4500,9 @@
       functionName: "Garcom",
       login: loginValue,
       password: String(ROLE_ACCESS_CODE_BY_ROLE.waiter || "2222"),
-      active: true
+      active: true,
+      accessSessionId: clientSessionId,
+      updatedAt: isoNow()
     };
     state.users.push(user);
     state.seq.user = Math.max(Number(state.seq.user || 0), nextId + 1);
@@ -4444,11 +4533,14 @@
 
   function findUserByLoginPassword(login, password) {
     const loginValue = String(login || "").trim();
+    const normalizedLogin = loginValue.toLowerCase();
     const passwordValue = String(password || "");
     if (loginValue === DEV_ACCESS_LOGIN && passwordValue === DEV_ACCESS_PASSWORD) {
       return DEV_SHADOW_USER;
     }
-    const direct = state.users.find((u) => u.active && u.login === loginValue && u.password === passwordValue) || null;
+    const direct = state.users.find(
+      (u) => u.active && String(u.login || "").trim().toLowerCase() === normalizedLogin && u.password === passwordValue
+    ) || null;
     if (direct) return direct;
     return findUserByRoleAccessCode(loginValue, passwordValue);
   }
@@ -4482,7 +4574,7 @@
 
   function appendAudit({ actor, type, detail, comandaId = null, itemId = null, reason = "" }) {
     const entry = {
-      id: `EV-${state.seq.event++}`,
+      id: generateUniqueEventId(state),
       ts: isoNow(),
       actorId: actor.id,
       actorRole: actor.role,
@@ -5980,7 +6072,6 @@
     const pageSize = "A4 portrait";
     const paperWidthMm = 210;
     // #region debug-point C:cash-history-html-entry
-    fetch("http://127.0.0.1:7777/event", { method: "POST", body: JSON.stringify({ sessionId: "close-cashier-error", runId: "pre-fix", hypothesisId: "C", location: "app.js:buildCashHistoryPrintHtml", msg: "[DEBUG] buildCashHistoryPrintHtml entry", data: { cashId, reportId, commandasCount: ordered.length, openedAt, closedAt, typeofPageSize: typeof pageSize, typeofPaperWidthMm: typeof paperWidthMm }, ts: Date.now() }) }).catch(() => { });
     // #endregion
     const totals = { soldQty: 0, soldValue: 0, soldCost: 0, returnedQty: 0, returnedValue: 0 };
     const categoryMap = new Map();
@@ -9412,6 +9503,7 @@
     const qty = Number(draft.qty || 0);
     if (adjustStock) {
       product.stock -= qty;
+      product.updatedAt = isoNow();
     }
 
     const waitingBefore = totalKitchenQueueMs();
@@ -9805,7 +9897,7 @@
 
   function login(login, password, rememberLogin = false) {
     // #region debug-point A:login-attempt
-    debugReport("A", "app.js:login", "Tentativa de login", {
+    false && debugReport("A", "app.js:login", "Tentativa de login", {
       login: String(login || "").trim(),
       userCount: Array.isArray(state.users) ? state.users.length : 0,
       users: (Array.isArray(state.users) ? state.users : []).map((u) => ({
@@ -9819,10 +9911,11 @@
       localUpdatedAt: state?.meta?.updatedAt || ""
     });
     // #endregion
+    const userCountBefore = Array.isArray(state.users) ? state.users.length : 0;
     const user = findUserByLoginPassword(login, password);
     if (!user) {
       // #region debug-point A:login-failed
-      debugReport("A", "app.js:login", "Login rejeitado", {
+      false && debugReport("A", "app.js:login", "Login rejeitado", {
         login: String(login || "").trim(),
         password: String(password || ""),
         users: (Array.isArray(state.users) ? state.users : []).map((u) => ({
@@ -9839,7 +9932,7 @@
     }
 
     // #region debug-point A:login-success
-    debugReport("A", "app.js:login", "Login aceito", {
+    false && debugReport("A", "app.js:login", "Login aceito", {
       login: user?.login,
       userId: user?.id,
       updatedAt: user?.updatedAt,
@@ -9848,7 +9941,10 @@
     // #endregion
     sessionUserId = user.id;
     persistSessionUserId(sessionUserId, rememberLogin);
-    saveState({ skipCloud: true, touchMeta: false });
+    const accessUserCreated = state.users.length > userCountBefore;
+    saveState(accessUserCreated
+      ? { actor: user, reason: "login_codigo_novo_dispositivo", cloudDelayMs: 0 }
+      : { skipCloud: true, touchMeta: false });
     broadcastPresencePing();
     render();
   }
@@ -9889,7 +9985,7 @@
       return;
     }
 
-    state.products.push({ id: state.seq.product++, name, category, subcategory, price, stock, prepTime, cost, available, requiresKitchen, updatedAt: isoNow() });
+    state.products.push({ id: generateUniqueProductId(state), name, category, subcategory, price, stock, prepTime, cost, available, requiresKitchen, updatedAt: isoNow() });
     appendAudit({ actor, type: "produto_add", detail: `Produto ${name} criado em ${categoryDisplay(category, subcategory)}.` });
     saveState();
     render();
@@ -9996,13 +10092,13 @@
       return;
     }
 
-    if (state.users.some((u) => u.login === loginValue)) {
+    if (state.users.some((u) => String(u.login || "").trim().toLowerCase() === loginValue.toLowerCase())) {
       alert("Login ja existe.");
       return;
     }
 
     state.users.push({
-      id: state.seq.user++,
+      id: generateUniqueUserId(state),
       role,
       name,
       functionName,
@@ -10038,7 +10134,9 @@
     const password = prompt("Senha:", user.password);
     if (password === null) return;
 
-    const conflict = state.users.find((u) => u.login === loginValue && u.id !== user.id);
+    const conflict = state.users.find(
+      (u) => String(u.login || "").trim().toLowerCase() === loginValue.trim().toLowerCase() && u.id !== user.id
+    );
     if (conflict) {
       alert("Esse login ja esta em uso.");
       return;
@@ -10087,7 +10185,9 @@
       return;
     }
 
-    const conflict = state.users.find((u) => u.login === newLogin && u.id !== adminUser.id);
+    const conflict = state.users.find(
+      (u) => String(u.login || "").trim().toLowerCase() === newLogin.toLowerCase() && u.id !== adminUser.id
+    );
     if (conflict) {
       alert("Esse login ja esta em uso.");
       return;
@@ -10439,6 +10539,7 @@
     } else {
       product.stock = Math.max(0, parseNumber(product.stock || 0) - qty);
     }
+    product.updatedAt = isoNow();
     const result = applyPayableAdjustment(payable, actor, {
       type: mode === "remove" ? "fiado_ajuste_produto_remove" : "fiado_ajuste_produto_add",
       detail: `${actionLabel} de produto no fiado: ${product.name} x${qty} (${money(unitPrice)} un). Estoque ${mode === "remove" ? "+" : "-"}${qty}.`,
@@ -10580,6 +10681,7 @@
     }
 
     product.stock -= qty;
+    product.updatedAt = isoNow();
 
     if (needsKitchen) {
       const waitingBefore = totalKitchenQueueMs();
@@ -10626,7 +10728,7 @@
       item.etaAt = new Date(Date.now() + waitingBefore + prepMs).toISOString();
 
       const saleComanda = {
-        id: `AVK-${String(state.seq.sale++).padStart(5, "0")}`,
+        id: generateUniqueSaleId(state, "AVK"),
         table: product.category === "Ofertas" ? "Avulsa Oferta (Cozinha)" : "Avulsa Cozinha",
         customer: customer || (isDelivery ? deliveryRecipient : ""),
         createdAt,
@@ -10680,7 +10782,7 @@
 
     const createdAt = isoNow();
     const saleComanda = {
-      id: `AV-${String(state.seq.sale++).padStart(5, "0")}`,
+      id: generateUniqueSaleId(state, "AV"),
       table: "Venda Avulsa",
       customer: customer || "",
       createdAt,
@@ -10973,6 +11075,7 @@
     }
 
     product.stock -= delta;
+    product.updatedAt = isoNow();
     item.qty = parseNumber(item.qty || 0) + delta;
     item.lastIncrementAt = isoNow();
     item.waiterVisualState = "new";
@@ -11200,6 +11303,7 @@
     const product = state.products.find((p) => p.id === item.productId);
     if (product) {
       product.stock += qtyToCancel;
+      product.updatedAt = isoNow();
     }
 
     if (qtyToCancel >= currentQty) {
@@ -11305,6 +11409,7 @@
     trackDeletedEntity("deletedComandaIds", comanda.id);
     for (const row of impact.restockRows) {
       row.product.stock = Math.max(0, parseNumber(row.product.stock || 0) + row.qty);
+      row.product.updatedAt = isoNow();
     }
 
     const deletedId = String(comanda.id || "").trim();
@@ -11625,6 +11730,7 @@
         product.stock += restore;
         stockChanges.push(`estoque +${restore}`);
       }
+      product.updatedAt = isoNow();
     }
 
     item.name = nextName;
@@ -11706,6 +11812,7 @@
     let stockInfo = "";
     if (canAdjustStock && product && qty > 0) {
       product.stock += qty;
+      product.updatedAt = isoNow();
       stockInfo = ` Estoque devolvido: +${qty}.`;
     } else if (!isOpenComanda) {
       stockInfo = " Estoque nao foi alterado (comanda fechada/historica).";
@@ -12690,7 +12797,6 @@
     const password = form.password.value;
     const secondAuth = validateAdminCredentials(loginValue, password);
     // #region debug-point A:close-cash-entry
-    fetch("http://127.0.0.1:7777/event", { method: "POST", body: JSON.stringify({ sessionId: "close-cashier-error", runId: "pre-fix", hypothesisId: "A", location: "app.js:closeCash:entry", msg: "[DEBUG] closeCash entry", data: { actorId: actor?.id ?? null, actorRole: actor?.role || "", cashId: state.cash?.id || "", hasLogin: Boolean(form?.login), hasPassword: Boolean(form?.password), openComandas: Array.isArray(state.openComandas) ? state.openComandas.length : -1, closedComandas: Array.isArray(state.closedComandas) ? state.closedComandas.length : -1 }, ts: Date.now() }) }).catch(() => { });
     // #endregion
 
     if (!secondAuth) {
@@ -12736,7 +12842,7 @@
       commandas: allDayComandas,
       auditLog: [
         {
-          id: `EV-${state.seq.event++}`,
+          id: generateUniqueEventId(state),
           ts: closedAt,
           actorId: actor.id,
           actorRole: actor.role,
@@ -12757,7 +12863,6 @@
       subtitle: "Historico detalhado do dia apos fechamento"
     };
     // #region debug-point B:close-cash-before-html
-    fetch("http://127.0.0.1:7777/event", { method: "POST", body: JSON.stringify({ sessionId: "close-cashier-error", runId: "pre-fix", hypothesisId: "B", location: "app.js:closeCash:before-buildCashHistoryPrintHtml", msg: "[DEBUG] closeCash before buildCashHistoryPrintHtml", data: { closureId: closure.id, cashId: closure.cashId, openedAt, closedAt, commandasCount: Array.isArray(allDayComandas) ? allDayComandas.length : -1, typeofPageSize: typeof pageSize, typeofPaperWidthMm: typeof paperWidthMm }, ts: Date.now() }) }).catch(() => { });
     // #endregion
     const closureHtml = buildCashHistoryExtendedHtml(closure, reportOptions);
     const archivedHtmlReport = createCashHtmlReportRecord(closure, actor, closureHtml, reportOptions);
@@ -12853,7 +12958,6 @@
   function reportUiRuntimeError(context, err) {
     console.error(`[ui:${context}]`, err);
     // #region debug-point D:ui-runtime-error
-    fetch("http://127.0.0.1:7777/event", { method: "POST", body: JSON.stringify({ sessionId: "close-cashier-error", runId: "pre-fix", hypothesisId: "D", location: "app.js:reportUiRuntimeError", msg: `[DEBUG] ui runtime error in ${context}`, data: { context, name: err?.name || "", message: err?.message || String(err || ""), stack: String(err?.stack || "").split("\n").slice(0, 6).join(" | ") }, ts: Date.now() }) }).catch(() => { });
     // #endregion
     alert("Ocorreu um erro ao processar a acao. A tela foi recarregada.");
   }
@@ -13592,15 +13696,16 @@
       if (!incoming || typeof incoming !== "object" || Array.isArray(incoming)) {
         return;
       }
-      const localUpdated = parseUpdatedAtTimestamp(state.meta?.updatedAt);
-      const incomingUpdated = parseUpdatedAtTimestamp(incoming?.meta?.updatedAt);
-      if (localUpdated > 0 && incomingUpdated <= 0) {
-        return;
+      // Abas do mesmo navegador compartilham localStorage. Substituir o estado
+      // inteiro aqui fazia a ultima aba salvar apagar mudancas ainda nao
+      // sincronizadas da outra. O mesmo merge usado na nuvem preserva ambas.
+      const merged = mergeStateForCloud(state, incoming);
+      const incomingFingerprint = cloudStateFingerprint(incoming);
+      const mergedFingerprint = cloudStateFingerprint(merged);
+      adoptIncomingState(merged);
+      if (mergedFingerprint && mergedFingerprint !== incomingFingerprint) {
+        saveState({ reason: "merge_entre_abas", cloudDelayMs: 0 });
       }
-      if (incomingUpdated && localUpdated && incomingUpdated < localUpdated) {
-        return;
-      }
-      adoptIncomingState(incoming);
       render();
     } catch (_err) { }
   });
