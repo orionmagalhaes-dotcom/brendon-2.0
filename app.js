@@ -82,6 +82,8 @@
   });
   const DEFAULT_RECEIPT_PAPER_WIDTH_MM = 58;
   const AUTO_OPEN_KITCHEN_PREVIEW_ON_ADD = false;
+  const ADMIN_PRODUCT_PAGE_SIZE = 36;
+  const WAITER_CATALOG_PAGE_SIZE = 40;
 
   const app = document.getElementById("app");
   const uiState = {
@@ -104,8 +106,12 @@
     adminComandaSearch: "",
     adminHistoryComandaSearch: "",
     adminKitchenSearch: "",
+    adminProductSearch: "",
+    adminProductCategory: "all",
+    adminProductVisibleLimit: ADMIN_PRODUCT_PAGE_SIZE,
     adminInlineEditComandaId: null,
     cookSearch: "",
+    waiterCatalogVisibleLimit: WAITER_CATALOG_PAGE_SIZE,
     supabaseStatus: "desconectado",
     supabaseLastError: "",
     devicePresenceBySession: {},
@@ -3215,23 +3221,57 @@
     return recovered;
   }
 
+  // O armazenamento local serve como partida offline. Arquivos historicos completos
+  // continuam no Supabase; grava-los a cada clique estoura a cota do navegador e
+  // transforma cada interacao em uma excecao sincrona cara.
+  const LOCAL_ARCHIVE_FIELDS = [
+    "history90",
+    "cookHistory",
+    "cashHtmlReports",
+    "internalCashAudits",
+    "financeCycleReports",
+    "auditLog"
+  ];
+  let localPersistenceWarningShown = false;
+
+  function localStateSnapshot(source) {
+    const snapshot = { ...(source || {}) };
+    for (const field of LOCAL_ARCHIVE_FIELDS) snapshot[field] = [];
+    snapshot.session = { userId: null };
+    return snapshot;
+  }
+
+  function persistLocalState(source) {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(localStateSnapshot(source)));
+      localPersistenceWarningShown = false;
+      return true;
+    } catch (err) {
+      if (!localPersistenceWarningShown) {
+        console.warn("[persistLocalState] Copia offline indisponivel; sincronizacao em nuvem permanece ativa.", err);
+        localPersistenceWarningShown = true;
+      }
+      return false;
+    }
+  }
+
   function loadState() {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) {
       const first = initialState();
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(first));
+      persistLocalState(first);
       return first;
     }
 
     try {
       const parsed = JSON.parse(raw);
       const merged = normalizeStateShape(parsed);
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(merged));
+      persistLocalState(merged);
       return merged;
     } catch (_err) {
       console.error("[loadState] Error loading state, using initial:", _err);
       const clean = initialState();
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(clean));
+      persistLocalState(clean);
       return clean;
     }
   }
@@ -3377,7 +3417,6 @@
   };
 
   let stateVersion = 0;
-  let lastRenderedVersion = -1;
   let lastPushAt = 0;
 
   function rememberObservedRemoteUpdatedAt(updatedAtValue) {
@@ -3419,9 +3458,7 @@
     state.meta = state.meta || {};
     state.meta.lastCloudSyncAt = isoNow();
     stateVersion++;
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-    } catch (_lsErr) { }
+    persistLocalState(state);
     rememberKnownRemoteUpdatedAt(remoteUpdatedAtValue);
     rememberSyncedCloudFingerprint(source);
     supabaseCtx.syncRetryCount = 0;
@@ -3907,22 +3944,7 @@
     pruneCashHtmlReports(state);
     pruneInternalCashAudits(state);
     pruneFinanceCycleReports(state);
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-    } catch (storageErr) {
-      console.warn("[saveState] localStorage cheio, tentando pruning agressivo...", storageErr);
-      try {
-        state.auditLog = (state.auditLog || []).slice(0, 500);
-        state.history90 = (state.history90 || []).slice(0, 30);
-        state.cookHistory = (state.cookHistory || []).slice(0, 200);
-        state.cashHtmlReports = (state.cashHtmlReports || []).slice(0, 30);
-        state.internalCashAudits = (state.internalCashAudits || []).slice(0, 30);
-        state.financeCycleReports = (state.financeCycleReports || []).slice(0, 30);
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-      } catch (retryErr) {
-        console.error("[saveState] Falha ao salvar mesmo apos pruning:", retryErr);
-      }
-    }
+    persistLocalState(state);
     if (!options.skipCloud) {
       queuePendingStateChangeBroadcast({
         actor: options.actor,
@@ -5459,8 +5481,8 @@
       .join("");
   }
 
-  function renderProductsByCategory(category) {
-    const products = state.products.filter((p) => p.category === category);
+  function renderProductsByCategory(category, sourceProducts = state.products) {
+    const products = sourceProducts.filter((p) => p.category === category);
     if (!products.length) {
       return `<div class="empty">Sem produtos cadastrados em ${esc(category)}.</div>`;
     }
@@ -5485,6 +5507,17 @@
   }
 
   function renderAdminProducts() {
+    const normalizedSearch = normalizeSearchText(uiState.adminProductSearch);
+    const categoryFilter = uiState.adminProductCategory || "all";
+    const filteredProducts = state.products.filter((product) => {
+      if (categoryFilter !== "all" && product.category !== categoryFilter) return false;
+      return productMatchesSearch(product, normalizedSearch);
+    });
+    const visibleLimit = Math.max(ADMIN_PRODUCT_PAGE_SIZE, Number(uiState.adminProductVisibleLimit || ADMIN_PRODUCT_PAGE_SIZE));
+    const visibleProducts = filteredProducts.slice(0, visibleLimit);
+    const visibleCategories = CATEGORIES.filter((category) => visibleProducts.some((product) => product.category === category));
+    const remainingCount = Math.max(0, filteredProducts.length - visibleProducts.length);
+
     return `
       <div class="grid cols-2">
         <div class="card">
@@ -5545,9 +5578,31 @@
           </div>
         </div>
       </div>
-      <div class="grid" style="margin-top:1rem;">
-        ${CATEGORIES.map((category) => `<div class="card"><h3>${esc(category)}</h3>${renderProductsByCategory(category)}</div>`).join("")}
+      <div class="card" style="margin-top:1rem;">
+        <h3>Localizar produtos</h3>
+        <div class="grid cols-2" style="margin-top:0.75rem;">
+          <div class="field">
+            <label>Buscar por nome ou codigo</label>
+            <input type="search" data-role="admin-product-search" value="${esc(uiState.adminProductSearch)}" placeholder="Digite para filtrar" autocomplete="off" />
+          </div>
+          <div class="field">
+            <label>Categoria</label>
+            <select data-role="admin-product-category">
+              <option value="all" ${categoryFilter === "all" ? "selected" : ""}>Todas</option>
+              ${CATEGORIES.map((category) => `<option value="${esc(category)}" ${categoryFilter === category ? "selected" : ""}>${esc(category)}</option>`).join("")}
+            </select>
+          </div>
+        </div>
+        <p class="note">Exibindo ${visibleProducts.length} de ${filteredProducts.length} produto(s). A lista e carregada em blocos para manter a tela leve.</p>
       </div>
+      <div class="grid" style="margin-top:1rem;">
+        ${visibleCategories.length
+          ? visibleCategories.map((category) => `<div class="card"><h3>${esc(category)}</h3>${renderProductsByCategory(category, visibleProducts)}</div>`).join("")
+          : `<div class="empty">Nenhum produto encontrado para o filtro informado.</div>`}
+      </div>
+      ${remainingCount
+        ? `<div class="actions" style="margin-top:1rem; justify-content:center;"><button class="btn secondary" type="button" data-action="load-more-admin-products">Carregar mais (${remainingCount} restantes)</button></div>`
+        : ""}
     `;
   }
 
@@ -8559,6 +8614,9 @@
 
     const availableCount = rows.filter((p) => p.available !== false && Number(p.stock || 0) > 0).length;
     const unavailableCount = rows.length - availableCount;
+    const visibleLimit = Math.max(WAITER_CATALOG_PAGE_SIZE, Number(uiState.waiterCatalogVisibleLimit || WAITER_CATALOG_PAGE_SIZE));
+    const visibleRows = rows.slice(0, visibleLimit);
+    const remainingCount = Math.max(0, rows.length - visibleRows.length);
 
     return `
       <div class="grid cols-2">
@@ -8586,8 +8644,8 @@
         </div>
         <div class="card">
           <h3>Cardapio Atual</h3>
-          ${rows.length
-        ? `<div class="table-wrap" style="margin-top:0.75rem;"><table class="responsive-stack waiter-catalog-table"><thead><tr><th>Produto</th><th>Categoria</th><th>Preco</th><th>Disponibilidade</th><th>Estoque</th><th>Fluxo</th></tr></thead><tbody>${rows
+          ${visibleRows.length
+        ? `<div class="table-wrap" style="margin-top:0.75rem;"><table class="responsive-stack waiter-catalog-table"><thead><tr><th>Produto</th><th>Categoria</th><th>Preco</th><th>Disponibilidade</th><th>Estoque</th><th>Fluxo</th></tr></thead><tbody>${visibleRows
           .map((p) => {
             const status =
               p.available === false ? "Indisponivel (admin)" : Number(p.stock || 0) <= 0 ? "Sem estoque" : "Disponivel";
@@ -8596,6 +8654,9 @@
           })
           .join("")}</tbody></table></div>`
         : `<div class="empty" style="margin-top:0.75rem;">Nenhum item encontrado para o filtro informado.</div>`}
+          ${remainingCount
+            ? `<div class="actions" style="margin-top:0.75rem; justify-content:center;"><button class="btn secondary" type="button" data-action="load-more-waiter-catalog">Carregar mais (${remainingCount} restantes)</button></div>`
+            : ""}
         </div>
       </div>
     `;
@@ -8966,6 +9027,24 @@
 
   let backgroundRenderPending = false;
   let backgroundRenderTimer = null;
+  let searchRenderTimer = null;
+  let productSearchTimer = null;
+
+  function scheduleSearchRender() {
+    if (searchRenderTimer) clearTimeout(searchRenderTimer);
+    searchRenderTimer = setTimeout(() => {
+      searchRenderTimer = null;
+      render();
+    }, 160);
+  }
+
+  function scheduleProductSearchRefresh(form) {
+    if (productSearchTimer) clearTimeout(productSearchTimer);
+    productSearchTimer = setTimeout(() => {
+      productSearchTimer = null;
+      if (form?.isConnected) refreshComandaProductSelect(form);
+    }, 90);
+  }
 
   function isEditableControl(element) {
     if (!element || !app.contains(element)) return false;
@@ -8988,31 +9067,33 @@
     return `index:${Array.from(app.querySelectorAll("form")).indexOf(form)}`;
   }
 
-  function formDraftControlKey(control) {
-    const scope = control.closest("form") || app;
-    const identity = control.id
+  function formDraftControlIdentity(control) {
+    return control.id
       ? `id:${control.id}`
       : control.dataset.role
         ? `role:${control.dataset.role}`
         : control.name
           ? `name:${control.name}`
           : `tag:${control.tagName.toLowerCase()}`;
-    const candidates = Array.from(scope.querySelectorAll("input, textarea, select")).filter((candidate) => {
-      const candidateIdentity = candidate.id
-        ? `id:${candidate.id}`
-        : candidate.dataset.role
-          ? `role:${candidate.dataset.role}`
-          : candidate.name
-            ? `name:${candidate.name}`
-            : `tag:${candidate.tagName.toLowerCase()}`;
-      return candidateIdentity === identity;
+  }
+
+  function listFormDraftControls() {
+    const occurrenceByIdentity = new Map();
+    return Array.from(app.querySelectorAll("input, textarea, select")).map((control) => {
+      const baseKey = `${formDraftScopeKey(control)}|${formDraftControlIdentity(control)}`;
+      const occurrence = occurrenceByIdentity.get(baseKey) || 0;
+      occurrenceByIdentity.set(baseKey, occurrence + 1);
+      return { control, key: `${baseKey}|${occurrence}` };
     });
-    return `${formDraftScopeKey(control)}|${identity}|${Math.max(0, candidates.indexOf(control))}`;
+  }
+
+  function formDraftControlKey(control) {
+    return listFormDraftControls().find((entry) => entry.control === control)?.key || null;
   }
 
   function captureFormDrafts() {
     const drafts = new Map();
-    app.querySelectorAll("input, textarea, select").forEach((control) => {
+    listFormDraftControls().forEach(({ control, key }) => {
       const type = String(control.type || "").toLowerCase();
       if (control.disabled || control.readOnly || ["button", "submit", "reset", "hidden", "file"].includes(type)) return;
       const draft = { tag: control.tagName, type };
@@ -9023,15 +9104,15 @@
       } else {
         draft.value = control.value;
       }
-      drafts.set(formDraftControlKey(control), draft);
+      drafts.set(key, draft);
     });
     return drafts;
   }
 
   function restoreFormDrafts(drafts) {
     if (!(drafts instanceof Map) || !drafts.size) return;
-    app.querySelectorAll("input, textarea, select").forEach((control) => {
-      const draft = drafts.get(formDraftControlKey(control));
+    listFormDraftControls().forEach(({ control, key }) => {
+      const draft = drafts.get(key);
       if (!draft || draft.tag !== control.tagName) return;
       if (draft.type === "checkbox" || draft.type === "radio") {
         control.checked = Boolean(draft.checked);
@@ -9067,6 +9148,10 @@
   }
 
   function render(options = {}) {
+    if (searchRenderTimer) {
+      clearTimeout(searchRenderTimer);
+      searchRenderTimer = null;
+    }
     const preserveDrafts = Boolean(options.preserveDrafts);
     const formDrafts = preserveDrafts ? captureFormDrafts() : null;
     if (!preserveDrafts) backgroundRenderPending = false;
@@ -9128,7 +9213,7 @@
 
     if (activeSelector || activeControlKey) {
       const el = activeControlKey
-        ? Array.from(app.querySelectorAll("input, textarea, select")).find((control) => formDraftControlKey(control) === activeControlKey)
+        ? listFormDraftControls().find((entry) => entry.key === activeControlKey)?.control
         : document.querySelector(activeSelector);
       if (el) {
         if (activeVal !== null && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.tagName === "SELECT")) {
@@ -12470,6 +12555,26 @@
     return Boolean(window.qz && window.qz.websocket && window.qz.configs && window.qz.printers && window.qz.print);
   }
 
+  let qzLibraryLoadPromise = null;
+
+  function loadQzLibrary() {
+    if (qzLibraryAvailable()) return Promise.resolve();
+    if (qzLibraryLoadPromise) return qzLibraryLoadPromise;
+    qzLibraryLoadPromise = new Promise((resolve, reject) => {
+      const script = document.createElement("script");
+      script.src = "https://cdn.jsdelivr.net/npm/qz-tray@2.2.4/qz-tray.js";
+      script.async = true;
+      script.dataset.role = "qz-tray-library";
+      script.addEventListener("load", () => resolve(), { once: true });
+      script.addEventListener("error", () => reject(new Error("Falha ao carregar a biblioteca QZ Tray.")), { once: true });
+      document.head.appendChild(script);
+    }).catch((error) => {
+      qzLibraryLoadPromise = null;
+      throw error;
+    });
+    return qzLibraryLoadPromise;
+  }
+
   function ensureQzSecurityConfig() {
     if (!qzLibraryAvailable() || uiState.qzSecurityConfigured) return;
     try {
@@ -12481,6 +12586,7 @@
   }
 
   async function ensureQzConnected() {
+    await loadQzLibrary();
     if (!qzLibraryAvailable()) {
       throw new Error("QZ Tray nao detectado no navegador.");
     }
@@ -13272,6 +13378,18 @@
         return;
       }
 
+      if (action === "load-more-admin-products") {
+        uiState.adminProductVisibleLimit = Number(uiState.adminProductVisibleLimit || ADMIN_PRODUCT_PAGE_SIZE) + ADMIN_PRODUCT_PAGE_SIZE;
+        render();
+        return;
+      }
+
+      if (action === "load-more-waiter-catalog") {
+        uiState.waiterCatalogVisibleLimit = Number(uiState.waiterCatalogVisibleLimit || WAITER_CATALOG_PAGE_SIZE) + WAITER_CATALOG_PAGE_SIZE;
+        render();
+        return;
+      }
+
       if (action === "close-waiter-ready-modal") {
         uiState.waiterReadyModalItems = [];
         render();
@@ -13872,44 +13990,81 @@
       }
 
       if (target.matches('[data-role="waiter-search"]')) {
-        uiState.waiterComandaSearch = target.value || "";
-        render();
+        const nextValue = target.value || "";
+        if (uiState.waiterComandaSearch !== nextValue) {
+          uiState.waiterComandaSearch = nextValue;
+          scheduleSearchRender();
+        }
         return;
       }
 
       if (target.matches('[data-role="waiter-catalog-search"]')) {
-        uiState.waiterCatalogSearch = target.value || "";
-        render();
+        const nextValue = target.value || "";
+        if (uiState.waiterCatalogSearch !== nextValue) {
+          uiState.waiterCatalogSearch = nextValue;
+          uiState.waiterCatalogVisibleLimit = WAITER_CATALOG_PAGE_SIZE;
+          scheduleSearchRender();
+        }
         return;
       }
 
       if (target.matches('[data-role="waiter-catalog-category"]')) {
         uiState.waiterCatalogCategory = target.value || "all";
+        uiState.waiterCatalogVisibleLimit = WAITER_CATALOG_PAGE_SIZE;
         render();
+        return;
+      }
+
+      if (target.matches('[data-role="admin-product-category"]')) {
+        uiState.adminProductCategory = target.value || "all";
+        uiState.adminProductVisibleLimit = ADMIN_PRODUCT_PAGE_SIZE;
+        render();
+        return;
+      }
+
+      if (target.matches('[data-role="admin-product-search"]')) {
+        const nextValue = target.value || "";
+        if (uiState.adminProductSearch !== nextValue) {
+          uiState.adminProductSearch = nextValue;
+          uiState.adminProductVisibleLimit = ADMIN_PRODUCT_PAGE_SIZE;
+          scheduleSearchRender();
+        }
         return;
       }
 
       if (target.matches('[data-role="admin-search"]')) {
-        uiState.adminComandaSearch = target.value || "";
-        render();
+        const nextValue = target.value || "";
+        if (uiState.adminComandaSearch !== nextValue) {
+          uiState.adminComandaSearch = nextValue;
+          scheduleSearchRender();
+        }
         return;
       }
 
       if (target.matches('[data-role="admin-history-comanda-search"]')) {
-        uiState.adminHistoryComandaSearch = target.value || "";
-        render();
+        const nextValue = target.value || "";
+        if (uiState.adminHistoryComandaSearch !== nextValue) {
+          uiState.adminHistoryComandaSearch = nextValue;
+          scheduleSearchRender();
+        }
         return;
       }
 
       if (target.matches('[data-role="admin-kitchen-search"]')) {
-        uiState.adminKitchenSearch = target.value || "";
-        render();
+        const nextValue = target.value || "";
+        if (uiState.adminKitchenSearch !== nextValue) {
+          uiState.adminKitchenSearch = nextValue;
+          scheduleSearchRender();
+        }
         return;
       }
 
       if (target.matches('[data-role="cook-search"]')) {
-        uiState.cookSearch = target.value || "";
-        render();
+        const nextValue = target.value || "";
+        if (uiState.cookSearch !== nextValue) {
+          uiState.cookSearch = nextValue;
+          scheduleSearchRender();
+        }
         return;
       }
     } catch (err) {
@@ -13937,27 +14092,44 @@
       }
       if (target.matches('[data-role="item-product-search"]')) {
         const form = target.closest('form[data-role="add-item-form"], form[data-role="fiado-add-item-form"]');
-        if (form) refreshComandaProductSelect(form);
+        if (form) scheduleProductSearchRefresh(form);
         return;
       }
       if (target.matches('[data-role="waiter-catalog-search"]')) {
         uiState.waiterCatalogSearch = target.value || "";
-        render();
+        uiState.waiterCatalogVisibleLimit = WAITER_CATALOG_PAGE_SIZE;
+        scheduleSearchRender();
+        return;
+      }
+      if (target.matches('[data-role="admin-product-search"]')) {
+        uiState.adminProductSearch = target.value || "";
+        uiState.adminProductVisibleLimit = ADMIN_PRODUCT_PAGE_SIZE;
+        scheduleSearchRender();
+        return;
+      }
+      if (target.matches('[data-role="waiter-search"]')) {
+        uiState.waiterComandaSearch = target.value || "";
+        scheduleSearchRender();
+        return;
+      }
+      if (target.matches('[data-role="admin-search"]')) {
+        uiState.adminComandaSearch = target.value || "";
+        scheduleSearchRender();
         return;
       }
       if (target.matches('[data-role="admin-kitchen-search"]')) {
         uiState.adminKitchenSearch = target.value || "";
-        render();
+        scheduleSearchRender();
         return;
       }
       if (target.matches('[data-role="admin-history-comanda-search"]')) {
         uiState.adminHistoryComandaSearch = target.value || "";
-        render();
+        scheduleSearchRender();
         return;
       }
       if (target.matches('[data-role="cook-search"]')) {
         uiState.cookSearch = target.value || "";
-        render();
+        scheduleSearchRender();
       }
     } catch (err) {
       reportUiRuntimeError("input", err);
@@ -14006,31 +14178,6 @@
       navigator.serviceWorker.register("./sw.js").catch(() => { });
     });
   }
-
-  setInterval(() => {
-    // Só re-renderiza se o estado realmente mudou (evita disrupcao no garcom/celular)
-    if (stateVersion === lastRenderedVersion) return;
-    lastRenderedVersion = stateVersion;
-    const user = getCurrentUser();
-    if (user?.role === "waiter" && uiState.waiterTab === "cozinha") {
-      requestBackgroundRender();
-    }
-    if (user?.role === "cook" && uiState.cookTab === "ativos") {
-      requestBackgroundRender();
-    }
-    if (
-      user?.role === "admin" &&
-      (uiState.adminTab === "monitor" ||
-        uiState.adminTab === "dashboard" ||
-        uiState.adminTab === "arquivos_html" ||
-        (uiState.adminTab === "comandas" && uiState.waiterTab === "cozinha"))
-    ) {
-      requestBackgroundRender();
-    }
-    if (user?.role === "dev" && (uiState.devTab === "monitor" || uiState.devTab === "devices" || uiState.devTab === "dashboard")) {
-      requestBackgroundRender();
-    }
-  }, 5000);
 
   setInterval(() => {
     broadcastPresencePing();
