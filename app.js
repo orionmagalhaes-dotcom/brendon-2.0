@@ -21,6 +21,9 @@
   const CATALOG_BACKUPS_META_KEY = "catalogBackups";
   const CATALOG_BACKUPS_LIMIT = 30;
   const SUPABASE_BACKUPS_TABLE = "restobar_backups";
+  const CLOUD_ARCHIVE_ROW_PREFIX = "archive-v1-";
+  const CLOUD_MAIN_CATALOG_BACKUPS_LIMIT = 3;
+  const CLOUD_ARCHIVE_WRITE_BATCH = 4;
   const BACKUP_AUTO_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6 horas
   const EDUARDO_RECOVERY_MARKER_KEY = "eduardo_restore_applied_v1";
   const ACCESS_CODE_WAITER_PREFIX = "Garcom Codigo";
@@ -3361,6 +3364,9 @@
     lastKnownRemoteUpdatedAt: "",
     lastObservedRemoteUpdatedAt: "",
     lastSyncedCloudFingerprint: "",
+    archiveFingerprints: new Map(),
+    archiveRows: [],
+    archiveSignature: "",
     pendingStateChangeBroadcast: null,
     prioritizeNextCloudSync: false
   };
@@ -3531,6 +3537,73 @@
       comandaId: String(comandaId || "")
     };
     broadcastRealtimePayload("comanda_deleted", payload);
+  }
+
+  function cloudArchiveRowId(kind, id) {
+    return `${CLOUD_ARCHIVE_ROW_PREFIX}${kind}-${String(id || "").replace(/[^a-zA-Z0-9_-]/g, "_")}`;
+  }
+
+  // O estado operacional precisa permanecer pequeno: ele e regravado a cada
+  // pedido e tambem observado pelo Realtime. Historicos e relatorios sao
+  // imutaveis depois do fechamento, portanto ficam em linhas independentes.
+  function splitCloudState(source) {
+    const full = sanitizeStateForCloud(source);
+    const archiveRows = [];
+    const addRows = (kind, rows) => {
+      for (const row of Array.isArray(rows) ? rows : []) {
+        const id = String(row?.id || "").trim();
+        if (!id) continue;
+        archiveRows.push({
+          id: cloudArchiveRowId(kind, id),
+          reason: `cloud-archive-${kind}`.slice(0, 64),
+          created_at: normalizeIsoTimestamp(row?.updatedAt || row?.closedAt || row?.createdAt) || isoNow(),
+          payload: { archiveKind: kind, data: row }
+        });
+      }
+    };
+    addRows("history", full.history90);
+    addRows("cash-report", full.cashHtmlReports);
+    addRows("cash-audit", full.internalCashAudits);
+
+    full.history90 = [];
+    full.cashHtmlReports = [];
+    full.internalCashAudits = [];
+    full.meta = full.meta || {};
+    full.meta.cloudArchiveVersion = 1;
+    full.meta.cloudArchiveCount = archiveRows.length;
+    full.meta.cloudArchiveSignature = hashText(archiveRows.map((row) => row.id).sort().join("|"));
+    if (Array.isArray(full.meta[CATALOG_BACKUPS_META_KEY])) {
+      full.meta[CATALOG_BACKUPS_META_KEY] = full.meta[CATALOG_BACKUPS_META_KEY].slice(-CLOUD_MAIN_CATALOG_BACKUPS_LIMIT);
+    }
+    return { main: full, archiveRows };
+  }
+
+  function assembleCloudState(mainPayload, archiveRows) {
+    const assembled = sanitizeStateForCloud(mainPayload || {});
+    const history90 = [];
+    const cashHtmlReports = [];
+    const internalCashAudits = [];
+    for (const row of Array.isArray(archiveRows) ? archiveRows : []) {
+      const kind = String(row?.payload?.archiveKind || "");
+      const data = row?.payload?.data;
+      if (!data || typeof data !== "object") continue;
+      if (kind === "history") history90.push(data);
+      else if (kind === "cash-report") cashHtmlReports.push(data);
+      else if (kind === "cash-audit") internalCashAudits.push(data);
+    }
+    assembled.history90 = mergeRowsByIdWithTimestamp(assembled.history90, history90, {
+      getTimestamp: (row) => row?.closedAt || row?.createdAt || "",
+      preferLocal: false
+    });
+    assembled.cashHtmlReports = mergeRowsByIdWithTimestamp(assembled.cashHtmlReports, cashHtmlReports, {
+      getTimestamp: (row) => row?.closedAt || row?.createdAt || "",
+      preferLocal: false
+    });
+    assembled.internalCashAudits = mergeRowsByIdWithTimestamp(assembled.internalCashAudits, internalCashAudits, {
+      getTimestamp: (row) => row?.closedAt || row?.createdAt || "",
+      preferLocal: false
+    });
+    return assembled;
   }
 
   function publishCashClosed(closure, nextCash, actor) {
@@ -3887,6 +3960,40 @@
     return supabaseCtx.client;
   }
 
+  async function loadCloudArchiveRows(client) {
+    const { data, error } = await client
+      .from(SUPABASE_BACKUPS_TABLE)
+      .select("id,payload,created_at")
+      .like("id", `${CLOUD_ARCHIVE_ROW_PREFIX}%`)
+      .gte("created_at", new Date(Date.now() - HISTORY_RETENTION_DAYS * 24 * 60 * 60 * 1000).toISOString());
+    if (error) throw error;
+    const rows = Array.isArray(data) ? data : [];
+    supabaseCtx.archiveFingerprints = new Map(rows.map((row) => [String(row.id), hashText(stableSerializeForHash(row.payload || {}))]));
+    supabaseCtx.archiveRows = rows;
+    supabaseCtx.archiveSignature = hashText(rows.map((row) => String(row.id)).sort().join("|"));
+    return rows;
+  }
+
+  async function persistCloudArchiveRows(client, archiveRows) {
+    // Arquivos de fechamento sao imutaveis. Registros existentes nunca sao
+    // regravados, evitando custo e conflitos com a politica append-only.
+    const changed = (Array.isArray(archiveRows) ? archiveRows : []).filter(
+      (row) => !supabaseCtx.archiveFingerprints.has(String(row.id))
+    );
+    for (let offset = 0; offset < changed.length; offset += CLOUD_ARCHIVE_WRITE_BATCH) {
+      const batch = changed.slice(offset, offset + CLOUD_ARCHIVE_WRITE_BATCH);
+      const { error } = await client.from(SUPABASE_BACKUPS_TABLE).insert(batch);
+      if (error) throw error;
+      for (const row of batch) {
+        supabaseCtx.archiveFingerprints.set(String(row.id), hashText(stableSerializeForHash(row.payload || {})));
+        supabaseCtx.archiveRows.push(row);
+      }
+    }
+    if (changed.length) {
+      supabaseCtx.archiveSignature = hashText(supabaseCtx.archiveRows.map((row) => String(row.id)).sort().join("|"));
+    }
+  }
+
   function scheduleSupabaseSync(options = {}) {
     supabaseCtx.syncQueued = true;
     if (supabaseCtx.syncTimer) {
@@ -3983,16 +4090,25 @@
       }
       mergedForCloud = applyCatalogBackupRecovery(mergedForCloud, sanitized, remoteData?.payload || null);
       ensureCatalogBackup(mergedForCloud, "sync");
-      if (remoteData?.payload && typeof remoteData.payload === "object" && areCloudStatesEquivalent(mergedForCloud, remoteData.payload)) {
+      const cloudParts = splitCloudState(mergedForCloud);
+      const remoteMainPayload = remoteData?.payload && typeof remoteData.payload === "object"
+        ? splitCloudState(remoteData.payload).main
+        : null;
+      if (remoteMainPayload && areCloudStatesEquivalent(cloudParts.main, remoteMainPayload)) {
+        await persistCloudArchiveRows(client, cloudParts.archiveRows);
         finalizeSuccessfulCloudSync(mergedForCloud, remoteData.updated_at, syncBaseVersion);
         clearPendingStateChangeBroadcast();
         return;
       }
 
+      // Arquivos sao gravados primeiro. Assim, quando a versao da linha main
+      // mudar, qualquer aparelho que fizer pull ja encontra o historico.
+      await persistCloudArchiveRows(client, cloudParts.archiveRows);
+
       const payload = {
         id: "main",
         updated_at: isoNow(),
-        payload: mergedForCloud
+        payload: cloudParts.main
       };
       // Optimistic locking: só atualiza se updated_at não mudou desde o read
       const remoteUpdatedAt = typeof remoteData?.updated_at === "string" ? remoteData.updated_at.trim() : "";
@@ -4016,7 +4132,7 @@
         supabaseCtx.syncQueued = true;
         return;
       }
-      finalizeSuccessfulCloudSync(payload.payload, writtenUpdatedAt || payload.updated_at, syncBaseVersion);
+      finalizeSuccessfulCloudSync(mergedForCloud, writtenUpdatedAt || payload.updated_at, syncBaseVersion);
       // #region debug-point E:sync-write-success
       false && debugReport("E", "app.js:syncStateToSupabase", "Sync concluido com sucesso", {
         writtenUpdatedAt: writtenUpdatedAt || payload.updated_at,
@@ -4115,6 +4231,7 @@
       const { data, error } = await client
         .from(SUPABASE_BACKUPS_TABLE)
         .select("id, reason, created_at, payload")
+        .not("id", "like", `${CLOUD_ARCHIVE_ROW_PREFIX}%`)
         .order("created_at", { ascending: false })
         .limit(500);
       if (error) {
@@ -4169,7 +4286,17 @@
     supabaseCtx.pullQueued = false;
 
     try {
-      const { data, error } = await client.from("restobar_state").select("payload,updated_at").eq("id", "main").maybeSingle();
+      const mainResult = await client.from("restobar_state").select("payload,updated_at").eq("id", "main").maybeSingle();
+      const { data: mainData, error } = mainResult;
+      const remoteArchiveSignature = String(mainData?.payload?.meta?.cloudArchiveSignature || "");
+      const shouldReloadArchives =
+        !supabaseCtx.archiveRows.length ||
+        !remoteArchiveSignature ||
+        remoteArchiveSignature !== supabaseCtx.archiveSignature;
+      const archiveRows = shouldReloadArchives ? await loadCloudArchiveRows(client) : supabaseCtx.archiveRows;
+      const data = mainData?.payload
+        ? { ...mainData, payload: assembleCloudState(mainData.payload, archiveRows) }
+        : mainData;
       if (error || !data?.payload) {
         return;
       }
