@@ -131,6 +131,11 @@
       loginDraft: "",
       passwordDraft: ""
     },
+    // A tela pode ser atualizada por sincronizacao/realtime enquanto nao ha
+    // sessao ativa. Guardar o rascunho impede que a atualizacao apague o que
+    // esta sendo digitado no login.
+    loginDraft: "",
+    passwordDraft: "",
     quickSalePaidConfirm: true,
     printerPrefs: loadPrinterPrefs(),
     qzSecurityConfigured: false,
@@ -5370,6 +5375,12 @@
       </div>
     `;
   }
+  function syncLoginDraftFromForm(form) {
+    if (!form) return;
+    uiState.loginDraft = String(form.login?.value || "");
+    uiState.passwordDraft = String(form.password?.value || "");
+  }
+
   function renderLogin() {
     app.innerHTML = `
       <div class="login-wrap">
@@ -5381,11 +5392,11 @@
           <form id="login-form" class="form" autocomplete="off">
             <div class="field">
               <label>Login</label>
-              <input name="login" required placeholder="Seu login" autocomplete="username" />
+              <input name="login" required placeholder="Seu login" autocomplete="username" value="${esc(uiState.loginDraft)}" />
             </div>
             <div class="field">
               <label>Senha</label>
-              <input name="password" type="password" required placeholder="Sua senha" autocomplete="current-password" />
+              <input name="password" type="password" required placeholder="Sua senha" autocomplete="current-password" value="${esc(uiState.passwordDraft)}" />
             </div>
             <div class="actions">
               <button class="btn primary" type="submit">Entrar</button>
@@ -8955,6 +8966,10 @@
 
   function render() {
     persistComandaItemFormValues();
+    const loginFormBeforeRender = document.querySelector("#login-form");
+    if (loginFormBeforeRender) {
+      syncLoginDraftFromForm(loginFormBeforeRender);
+    }
     const deleteAuthFormBeforeRender = document.querySelector("#delete-comanda-auth-form");
     if (deleteAuthFormBeforeRender) {
       syncDeleteComandaAuthDraftFromForm(deleteAuthFormBeforeRender);
@@ -10069,6 +10084,8 @@
     });
     // #endregion
     sessionUserId = user.id;
+    uiState.loginDraft = "";
+    uiState.passwordDraft = "";
     persistSessionUserId(sessionUserId, rememberLogin);
     const accessUserCreated = state.users.length > userCountBefore;
     saveState(accessUserCreated
@@ -10081,6 +10098,8 @@
   function logout() {
     sessionUserId = null;
     persistSessionUserId(null);
+    uiState.loginDraft = "";
+    uiState.passwordDraft = "";
     uiState.waiterActiveComandaId = null;
     uiState.waiterReadyModalItems = [];
     uiState.waiterReadySeenMap = {};
@@ -13786,6 +13805,10 @@
   app.addEventListener("input", (event) => {
     try {
       const target = event.target;
+      if (target.closest("#login-form")) {
+        syncLoginDraftFromForm(target.closest("#login-form"));
+        return;
+      }
       if (target.closest("#delete-comanda-auth-form")) {
         const form = target.closest("#delete-comanda-auth-form");
         syncDeleteComandaAuthDraftFromForm(form);
