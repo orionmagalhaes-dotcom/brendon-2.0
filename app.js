@@ -8995,6 +8995,10 @@
 
     const user = getCurrentUser();
     if (!user) {
+      // Atualizacoes de nuvem/realtime nao tem nada para alterar na tela de
+      // acesso. Recriar o formulario aqui interrompia foco, teclado virtual e
+      // digitacao; a tela so e montada quando ainda nao existe uma em exibicao.
+      if (document.querySelector("#login-form")) return;
       renderLogin();
       return;
     }
