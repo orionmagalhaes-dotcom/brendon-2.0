@@ -3412,12 +3412,32 @@
     archiveFingerprints: new Map(),
     archiveRows: [],
     archiveSignature: "",
+    cloudFailureCount: 0,
+    nextCloudAttemptAt: 0,
     pendingStateChangeBroadcast: null,
     prioritizeNextCloudSync: false
   };
 
   let stateVersion = 0;
   let lastPushAt = 0;
+
+  function cloudCooldownRemaining() {
+    return Math.max(0, Number(supabaseCtx.nextCloudAttemptAt || 0) - Date.now());
+  }
+
+  function registerCloudSuccess() {
+    supabaseCtx.cloudFailureCount = 0;
+    supabaseCtx.nextCloudAttemptAt = 0;
+  }
+
+  function registerCloudFailure(error) {
+    supabaseCtx.cloudFailureCount = Math.min(Number(supabaseCtx.cloudFailureCount || 0) + 1, 8);
+    const delayMs = Math.min(5000 * 2 ** (supabaseCtx.cloudFailureCount - 1), 60000);
+    supabaseCtx.nextCloudAttemptAt = Math.max(Number(supabaseCtx.nextCloudAttemptAt || 0), Date.now() + delayMs);
+    const message = String(error?.message || error?.details || error || "Falha temporaria na nuvem.");
+    setSupabaseStatus("aviso", message);
+    return delayMs;
+  }
 
   function rememberObservedRemoteUpdatedAt(updatedAtValue) {
     const rawValue = typeof updatedAtValue === "string" ? updatedAtValue.trim() : "";
@@ -3464,6 +3484,7 @@
     supabaseCtx.syncRetryCount = 0;
     supabaseCtx.lastSyncError = "";
     supabaseCtx.lastSyncErrorAt = null;
+    registerCloudSuccess();
     setSupabaseStatus("conectado");
   }
 
@@ -3488,7 +3509,7 @@
         localBroadcastChannel.postMessage({ event, payload });
       } catch (_e) { }
     }
-    if (supabaseCtx.channel) {
+    if (supabaseCtx.channel && supabaseCtx.connected && cloudCooldownRemaining() === 0) {
       supabaseCtx.channel.send({ type: "broadcast", event, payload }).catch(() => { });
     }
   }
@@ -4027,7 +4048,7 @@
       clearTimeout(supabaseCtx.syncTimer);
     }
     const requestedDelay = Number.isFinite(Number(options.delayMs)) ? Number(options.delayMs) : CLOUD_SYNC_DEBOUNCE_MS;
-    const delayMs = options.immediate ? 0 : Math.max(0, requestedDelay);
+    const delayMs = Math.max(options.immediate ? 0 : Math.max(0, requestedDelay), cloudCooldownRemaining());
     supabaseCtx.syncTimer = setTimeout(() => {
       supabaseCtx.syncTimer = null;
       void syncStateToSupabase();
@@ -4056,6 +4077,11 @@
       return;
     }
     if (!supabaseCtx.syncQueued) return;
+    const cooldownMs = cloudCooldownRemaining();
+    if (cooldownMs > 0) {
+      scheduleSupabaseSync({ delayMs: cooldownMs });
+      return;
+    }
 
     supabaseCtx.syncInFlight = true;
     supabaseCtx.syncQueued = false;
@@ -4185,14 +4211,17 @@
       supabaseCtx.syncRetryCount = Math.min(supabaseCtx.syncRetryCount + 1, 8);
       supabaseCtx.lastSyncError = String(err?.message || err || "Falha ao sincronizar.");
       supabaseCtx.lastSyncErrorAt = isoNow();
-      setSupabaseStatus("aviso", supabaseCtx.lastSyncError);
+      registerCloudFailure(err);
     } finally {
       supabaseCtx.syncInFlight = false;
       if (supabaseCtx.syncQueued) {
         if (supabaseCtx.syncTimer) {
           clearTimeout(supabaseCtx.syncTimer);
         }
-        const retryDelay = Math.min(120 * Math.pow(2, supabaseCtx.syncRetryCount), 8000);
+        const retryDelay = Math.max(
+          Math.min(1000 * Math.pow(2, supabaseCtx.syncRetryCount), 60000),
+          cloudCooldownRemaining()
+        );
         supabaseCtx.syncTimer = setTimeout(() => {
           supabaseCtx.syncTimer = null;
           void syncStateToSupabase();
@@ -4305,6 +4334,7 @@
   async function pullStateFromSupabase() {
     const client = getSupabaseClient();
     if (!client) return;
+    if (cloudCooldownRemaining() > 0) return;
     if (supabaseCtx.pullInFlight) {
       supabaseCtx.pullQueued = true;
       return;
@@ -4325,6 +4355,7 @@
         ? { ...mainData, payload: assembleCloudState(mainData.payload, archiveRows) }
         : mainData;
       if (error || !data?.payload) {
+        registerCloudFailure(error || new Error("Estado remoto indisponivel."));
         return;
       }
       if (typeof data.payload !== "object" || Array.isArray(data.payload)) {
@@ -4405,25 +4436,30 @@
       // So confirma a versao depois que ela foi comparada e, quando
       // necessario, incorporada. Em caso de erro o polling tentara de novo.
       rememberKnownRemoteUpdatedAt(data.updated_at);
+      registerCloudSuccess();
       setSupabaseStatus("conectado");
     } catch (err) {
       console.error("[pullStateFromSupabase] Error:", err);
-      setSupabaseStatus("aviso", String(err?.message || err || "Falha ao ler cloud."));
+      registerCloudFailure(err);
     } finally {
       supabaseCtx.pullInFlight = false;
       if (supabaseCtx.pullQueued) {
         supabaseCtx.pullQueued = false;
-        void pullStateFromSupabase();
+        if (cloudCooldownRemaining() === 0) void pullStateFromSupabase();
       }
     }
   }
 
   async function pollSupabaseRemoteMetadata() {
     const client = getSupabaseClient();
-    if (!client || supabaseCtx.pullInFlight) return;
+    if (!client || supabaseCtx.pullInFlight || cloudCooldownRemaining() > 0) return;
     try {
       const { data, error } = await client.from("restobar_state").select("updated_at").eq("id", "main").maybeSingle();
-      if (error || !data?.updated_at) return;
+      if (error || !data?.updated_at) {
+        registerCloudFailure(error || new Error("Metadados remotos indisponiveis."));
+        return;
+      }
+      registerCloudSuccess();
       const observedUpdatedAt = rememberObservedRemoteUpdatedAt(data.updated_at);
       if (!observedUpdatedAt) return;
       const knownTs = String(supabaseCtx.lastKnownRemoteUpdatedAt || "").trim();
@@ -4431,7 +4467,9 @@
       if (currentObserved !== knownTs) {
         debouncedRemotePullFromSupabase();
       }
-    } catch (_err) { }
+    } catch (err) {
+      registerCloudFailure(err);
+    }
   }
 
   function pushRemoteMonitorEvent(payload) {
@@ -4491,13 +4529,13 @@
   function broadcastPresencePing() {
     const payload = buildPresencePayload();
     upsertDevicePresence(payload, { isSelf: true });
-    if (supabaseCtx.channel) {
+    if (supabaseCtx.channel && supabaseCtx.connected && cloudCooldownRemaining() === 0) {
       supabaseCtx.channel.send({ type: "broadcast", event: "presence_ping", payload }).catch(() => { });
     }
   }
 
   function publishSupabaseEvent(entry) {
-    if (!supabaseCtx.channel) return;
+    if (!supabaseCtx.channel || !supabaseCtx.connected || cloudCooldownRemaining() > 0) return;
     const payload = {
       ...entry,
       broadcastAt: isoNow()
