@@ -3713,34 +3713,34 @@
         void pullStateFromSupabase();
         break;
       case "cash_closed":
-        if (applyCashClosed(payload)) render();
+        if (applyCashClosed(payload)) requestBackgroundRender();
         rememberObservedRemoteUpdatedAt(payload.updatedAt);
         void pullStateFromSupabase();
         break;
       case "kitchen_order_upsert":
         if (applyKitchenOrderUpsert(payload)) {
-          render();
+          requestBackgroundRender();
         }
         rememberObservedRemoteUpdatedAt(payload.updatedAt);
         debouncedRemotePullFromSupabase();
         break;
       case "comanda_upsert":
         if (applyComandaUpsert(payload)) {
-          render();
+          requestBackgroundRender();
         }
         rememberObservedRemoteUpdatedAt(payload.updatedAt);
         debouncedRemotePullFromSupabase();
         break;
       case "comanda_closed":
         if (applyComandaClosed(payload)) {
-          render();
+          requestBackgroundRender();
         }
         rememberObservedRemoteUpdatedAt(payload.updatedAt);
         debouncedRemotePullFromSupabase();
         break;
       case "comanda_deleted":
         if (applyComandaDeleted(payload)) {
-          render();
+          requestBackgroundRender();
         }
         rememberObservedRemoteUpdatedAt(payload.updatedAt);
         debouncedRemotePullFromSupabase();
@@ -3749,7 +3749,7 @@
         upsertDevicePresence(payload);
         const user = getCurrentUser();
         if (user?.role === "dev" && uiState.devTab === "devices") {
-          render();
+          requestBackgroundRender();
         }
         break;
       case "audit_event":
@@ -3759,7 +3759,7 @@
           (u?.role === "admin" && (uiState.adminTab === "monitor" || uiState.adminTab === "cozinha" || uiState.adminTab === "dashboard")) ||
           (u?.role === "dev" && (uiState.devTab === "monitor" || uiState.devTab === "cozinha" || uiState.devTab === "dashboard"))
         ) {
-          render();
+          requestBackgroundRender();
         }
         break;
     }
@@ -4361,7 +4361,7 @@
         adoptIncomingState(incomingRecovered);
         state.meta.lastCloudSyncAt = isoNow();
         saveState({ skipCloud: true, touchMeta: false });
-        render();
+        requestBackgroundRender();
       }
       // #region debug-point D:pull-finish
       false && debugReport("D", "app.js:pullStateFromSupabase", "Pull finalizado", {
@@ -4512,7 +4512,7 @@
       const client = getSupabaseClient();
       if (!client) {
         uiState.initialCloudLoadComplete = true;
-        render();
+        requestBackgroundRender();
         return;
       }
 
@@ -8964,7 +8964,112 @@
     if (form.addonForItemId) form.addonForItemId.value = saved.addonForItemId || "";
   }
 
-  function render() {
+  let backgroundRenderPending = false;
+  let backgroundRenderTimer = null;
+
+  function isEditableControl(element) {
+    if (!element || !app.contains(element)) return false;
+    if (element.matches?.("textarea, select, [contenteditable='true']")) return true;
+    if (!element.matches?.("input")) return false;
+    return !["button", "submit", "reset", "checkbox", "radio", "hidden", "file"].includes(String(element.type || "text").toLowerCase());
+  }
+
+  function formDraftScopeKey(control) {
+    const form = control.closest("form");
+    if (!form) return "page";
+    if (form.id) return `id:${form.id}`;
+    const role = String(form.dataset.role || "");
+    const action = String(form.dataset.action || "");
+    const comandaId = String(form.dataset.comandaId || "");
+    const context = String(form.dataset.context || "");
+    if (role || action || comandaId || context) {
+      return `data:${role}|${action}|${comandaId}|${context}`;
+    }
+    return `index:${Array.from(app.querySelectorAll("form")).indexOf(form)}`;
+  }
+
+  function formDraftControlKey(control) {
+    const scope = control.closest("form") || app;
+    const identity = control.id
+      ? `id:${control.id}`
+      : control.dataset.role
+        ? `role:${control.dataset.role}`
+        : control.name
+          ? `name:${control.name}`
+          : `tag:${control.tagName.toLowerCase()}`;
+    const candidates = Array.from(scope.querySelectorAll("input, textarea, select")).filter((candidate) => {
+      const candidateIdentity = candidate.id
+        ? `id:${candidate.id}`
+        : candidate.dataset.role
+          ? `role:${candidate.dataset.role}`
+          : candidate.name
+            ? `name:${candidate.name}`
+            : `tag:${candidate.tagName.toLowerCase()}`;
+      return candidateIdentity === identity;
+    });
+    return `${formDraftScopeKey(control)}|${identity}|${Math.max(0, candidates.indexOf(control))}`;
+  }
+
+  function captureFormDrafts() {
+    const drafts = new Map();
+    app.querySelectorAll("input, textarea, select").forEach((control) => {
+      const type = String(control.type || "").toLowerCase();
+      if (control.disabled || control.readOnly || ["button", "submit", "reset", "hidden", "file"].includes(type)) return;
+      const draft = { tag: control.tagName, type };
+      if (type === "checkbox" || type === "radio") {
+        draft.checked = Boolean(control.checked);
+      } else if (control.tagName === "SELECT" && control.multiple) {
+        draft.values = Array.from(control.selectedOptions).map((option) => option.value);
+      } else {
+        draft.value = control.value;
+      }
+      drafts.set(formDraftControlKey(control), draft);
+    });
+    return drafts;
+  }
+
+  function restoreFormDrafts(drafts) {
+    if (!(drafts instanceof Map) || !drafts.size) return;
+    app.querySelectorAll("input, textarea, select").forEach((control) => {
+      const draft = drafts.get(formDraftControlKey(control));
+      if (!draft || draft.tag !== control.tagName) return;
+      if (draft.type === "checkbox" || draft.type === "radio") {
+        control.checked = Boolean(draft.checked);
+      } else if (control.tagName === "SELECT" && control.multiple) {
+        const selected = new Set(draft.values || []);
+        Array.from(control.options).forEach((option) => {
+          option.selected = selected.has(option.value);
+        });
+      } else if (draft.value !== undefined) {
+        control.value = draft.value;
+      }
+    });
+  }
+
+  function requestBackgroundRender() {
+    if (isEditableControl(document.activeElement)) {
+      backgroundRenderPending = true;
+      return;
+    }
+    backgroundRenderPending = false;
+    render({ preserveDrafts: true });
+  }
+
+  function flushBackgroundRenderWhenIdle() {
+    if (!backgroundRenderPending) return;
+    if (backgroundRenderTimer) clearTimeout(backgroundRenderTimer);
+    backgroundRenderTimer = setTimeout(() => {
+      backgroundRenderTimer = null;
+      if (!backgroundRenderPending || isEditableControl(document.activeElement)) return;
+      backgroundRenderPending = false;
+      render({ preserveDrafts: true });
+    }, 0);
+  }
+
+  function render(options = {}) {
+    const preserveDrafts = Boolean(options.preserveDrafts);
+    const formDrafts = preserveDrafts ? captureFormDrafts() : null;
+    if (!preserveDrafts) backgroundRenderPending = false;
     persistComandaItemFormValues();
     const loginFormBeforeRender = document.querySelector("#login-form");
     if (loginFormBeforeRender) {
@@ -8975,6 +9080,7 @@
       syncDeleteComandaAuthDraftFromForm(deleteAuthFormBeforeRender);
     }
     const activeEl = document.activeElement;
+    const activeControlKey = activeEl?.matches?.("input, textarea, select") ? formDraftControlKey(activeEl) : null;
     const activeSelector = activeEl?.id
       ? `#${activeEl.id}`
       : activeEl?.dataset?.role
@@ -9018,10 +9124,16 @@
     }
 
     hydrateAfterRender();
+    restoreFormDrafts(formDrafts);
 
-    if (activeSelector) {
-      const el = document.querySelector(activeSelector);
+    if (activeSelector || activeControlKey) {
+      const el = activeControlKey
+        ? Array.from(app.querySelectorAll("input, textarea, select")).find((control) => formDraftControlKey(control) === activeControlKey)
+        : document.querySelector(activeSelector);
       if (el) {
+        if (activeVal !== null && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.tagName === "SELECT")) {
+          el.value = activeVal;
+        }
         el.focus();
         if (selectionStart !== null && selectionEnd !== null && (el.tagName === "INPUT" || el.tagName === "TEXTAREA")) {
           try {
@@ -13853,10 +13965,14 @@
     }
   });
 
+  // Sincronizacoes recebidas durante a edicao atualizam o estado imediatamente,
+  // mas a interface so e redesenhada depois que o usuario sai do campo.
+  app.addEventListener("focusout", flushBackgroundRenderWhenIdle);
+
   window.addEventListener("storage", (event) => {
     if (event.key === PRINTER_PREFS_KEY) {
       uiState.printerPrefs = loadPrinterPrefs();
-      render();
+      requestBackgroundRender();
       return;
     }
     if (event.key !== STORAGE_KEY || !event.newValue) return;
@@ -13875,14 +13991,14 @@
       if (mergedFingerprint && mergedFingerprint !== incomingFingerprint) {
         saveState({ reason: "merge_entre_abas", cloudDelayMs: 0 });
       }
-      render();
+      requestBackgroundRender();
     } catch (_err) { }
   });
 
   window.addEventListener("beforeinstallprompt", (event) => {
     event.preventDefault();
     uiState.deferredPrompt = event;
-    render();
+    requestBackgroundRender();
   });
 
   if ("serviceWorker" in navigator) {
@@ -13897,10 +14013,10 @@
     lastRenderedVersion = stateVersion;
     const user = getCurrentUser();
     if (user?.role === "waiter" && uiState.waiterTab === "cozinha") {
-      render();
+      requestBackgroundRender();
     }
     if (user?.role === "cook" && uiState.cookTab === "ativos") {
-      render();
+      requestBackgroundRender();
     }
     if (
       user?.role === "admin" &&
@@ -13909,10 +14025,10 @@
         uiState.adminTab === "arquivos_html" ||
         (uiState.adminTab === "comandas" && uiState.waiterTab === "cozinha"))
     ) {
-      render();
+      requestBackgroundRender();
     }
     if (user?.role === "dev" && (uiState.devTab === "monitor" || uiState.devTab === "devices" || uiState.devTab === "dashboard")) {
-      render();
+      requestBackgroundRender();
     }
   }, 5000);
 
