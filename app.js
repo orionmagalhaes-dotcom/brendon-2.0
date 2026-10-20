@@ -3259,7 +3259,8 @@
     recomputeComandaSequence(recovered);
     ensureCatalogBackup(recovered, "normalize");
     pruneHistory(recovered);
-    prunePayables(recovered);\r\n    pruneDeletedIdsByTime(recovered);
+    prunePayables(recovered);
+    pruneDeletedIdsByTime(recovered);
     pruneCashHtmlReports(recovered);
     pruneInternalCashAudits(recovered);
     pruneFinanceCycleReports(recovered);
