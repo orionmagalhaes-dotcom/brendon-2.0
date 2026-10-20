@@ -4103,11 +4103,23 @@
     );
     for (let offset = 0; offset < changed.length; offset += CLOUD_ARCHIVE_WRITE_BATCH) {
       const batch = changed.slice(offset, offset + CLOUD_ARCHIVE_WRITE_BATCH);
-      const { error } = await client.from(SUPABASE_BACKUPS_TABLE).insert(batch);
-      if (error) throw error;
+      const { error } = await client
+        .from(SUPABASE_BACKUPS_TABLE)
+        .upsert(batch, { onConflict: "id", ignoreDuplicates: true });
+      if (error) {
+        const isDuplicateKey = error.code === "23505" ||
+          String(error.message || "").toLowerCase().includes("duplicate key") ||
+          String(error.message || "").toLowerCase().includes("unique constraint");
+        if (!isDuplicateKey) {
+          throw error;
+        }
+        console.warn("[archives] Registro de arquivo ja existente no Supabase (ignorado):", error.message);
+      }
       for (const row of batch) {
         supabaseCtx.archiveFingerprints.set(String(row.id), hashText(stableSerializeForHash(row.payload || {})));
-        supabaseCtx.archiveRows.push(row);
+        if (!supabaseCtx.archiveRows.some((existing) => String(existing.id) === String(row.id))) {
+          supabaseCtx.archiveRows.push(row);
+        }
       }
     }
     if (changed.length) {
@@ -4338,7 +4350,10 @@
       const snapshot = buildBackupSnapshot(reason);
       const { error } = await client
         .from(SUPABASE_BACKUPS_TABLE)
-        .insert({ id: snapshot.id, reason: snapshot.reason, created_at: snapshot.created_at, payload: snapshot.payload });
+        .upsert(
+          { id: snapshot.id, reason: snapshot.reason, created_at: snapshot.created_at, payload: snapshot.payload },
+          { onConflict: "id", ignoreDuplicates: true }
+        );
       if (error) {
         console.warn("[backup] Falha ao criar backup:", error.message);
       } else {
