@@ -1,6 +1,6 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
-  "name": "brendon-2",
+  "name": "brendon-novo",
   "account_id": "4798f27dfc9e1316538384eff817e8ee",
   "compatibility_date": "2026-02-14",
   "assets": {
