@@ -81,9 +81,9 @@
   const CLOUD_SYNC_DEBOUNCE_MS = 400;
   const CLOUD_PULL_DEBOUNCE_MS = 750;
   const CLOUD_REMOTE_PULL_DEBOUNCE_MS = 750;
-  // Consultar a nuvem a cada minuto reduz drasticamente o tráfego. As
-  // atualizações em tempo real continuam chegando pelo canal Realtime.
-  const CLOUD_POLL_INTERVAL_MS = 60 * 1000;
+  // Consultar a nuvem a cada 15s serve como fallback rápido caso o canal Realtime
+  // caia sem aviso do navegador, acelerando a detecção de reconexão.
+  const CLOUD_POLL_INTERVAL_MS = 15 * 1000;
   const ROLE_ACCESS_CODE_BY_ROLE = Object.freeze({
     admin: "1111",
     waiter: "2222"
@@ -4489,6 +4489,14 @@
         state.meta.lastCloudSyncAt = isoNow();
         saveState({ skipCloud: true, touchMeta: false });
         requestBackgroundRender();
+
+        const cloudMergedParts = splitCloudState(incomingRecovered);
+        const remoteMain = data?.payload && typeof data.payload === "object"
+          ? splitCloudState(data.payload).main
+          : null;
+        if (!remoteMain || !areCloudStatesEquivalent(cloudMergedParts.main, remoteMain)) {
+          scheduleSupabaseSync({ immediate: true, reason: "reconexao_offline_merge" });
+        }
       }
       // #region debug-point D:pull-finish
       false && debugReport("D", "app.js:pullStateFromSupabase", "Pull finalizado", {
@@ -4687,8 +4695,12 @@
         supabaseCtx.connected = true;
         supabaseCtx.reconnectAttempts = 0;
         clearSupabaseReconnectTimer();
+        registerCloudSuccess();
         setSupabaseStatus("conectado");
         broadcastPresencePing();
+        if (supabaseCtx.syncQueued || (state.meta?.updatedAt && (!state.meta?.lastCloudSyncAt || state.meta.updatedAt > state.meta.lastCloudSyncAt))) {
+          scheduleSupabaseSync({ immediate: true, reason: "channel_subscribed_flush" });
+        }
       } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED") {
         supabaseCtx.connected = false;
         supabaseCtx.reconnectAttempts = Math.min(supabaseCtx.reconnectAttempts + 1, 6);
@@ -14370,10 +14382,14 @@
       if (document.visibilityState === "visible") {
         broadcastPresencePing();
         if (supabaseCtx.client) {
+          registerCloudSuccess();
           void pollSupabaseRemoteMetadata();
           void pullStateFromSupabase();
           if (!supabaseCtx.connected) {
             void connectSupabase();
+          }
+          if (supabaseCtx.syncQueued || (state.meta?.updatedAt && (!state.meta?.lastCloudSyncAt || state.meta.updatedAt > state.meta.lastCloudSyncAt))) {
+            scheduleSupabaseSync({ immediate: true, reason: "visibility_flush" });
           }
         }
       }
@@ -14384,8 +14400,16 @@
     window.addEventListener("online", () => {
       setSupabaseStatus("conectando", "Rede restabelecida...");
       clearSupabaseReconnectTimer();
+      registerCloudSuccess();
+      supabaseCtx.syncRetryCount = 0;
+      supabaseCtx.reconnectAttempts = 0;
+      if (supabaseCtx.syncTimer) {
+        clearTimeout(supabaseCtx.syncTimer);
+        supabaseCtx.syncTimer = null;
+      }
       void connectSupabase();
       void pullStateFromSupabase();
+      scheduleSupabaseSync({ immediate: true, reason: "online_flush" });
     });
 
     window.addEventListener("offline", () => {
