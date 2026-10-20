@@ -63,6 +63,22 @@ begin
       using (id = 'main')
       with check (id = 'main');
   end if;
+
+  -- Bloqueia DELETE explicitamente. O RLS ja nega por padrao quando nao ha
+  -- policy, mas depender desse comportamento implicito e fragil. Uma policy
+  -- explicita com USING (false) garante que nenhum client anonimo consiga
+  -- apagar a linha singleton, independentemente de futuras alteracoes no
+  -- Supabase ou na configuracao do projeto.
+  if not exists (
+    select 1 from pg_policies
+    where schemaname = 'public' and tablename = 'restobar_state' and policyname = 'deny_anon_delete_restobar_state'
+  ) then
+    create policy deny_anon_delete_restobar_state
+      on public.restobar_state
+      for delete
+      to anon
+      using (false);
+  end if;
 end $$;
 
 -- Habilita Realtime replication para a tabela restobar_state

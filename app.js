@@ -2,7 +2,9 @@
 "use strict";
 
 (() => {
-  const STORAGE_KEY = "restobar_control_v1";
+  // Estado local isolado por projeto: impede que um cache do Supabase antigo
+  // seja reenviado por engano ao projeto atual durante a troca de backend.
+  const STORAGE_KEY = "restobar_control_v2_avocfpretwjxrtfwlsqd";
   const SESSION_KEY = "restobar_local_session_user";
   const SESSION_TAB_KEY = "restobar_local_session_user_tab";
   const CLIENT_SESSION_KEY = "restobar_local_client_session_id";
@@ -10,6 +12,9 @@
   const HISTORY_RETENTION_DAYS = 90;
   const CASH_HTML_REPORT_RETENTION_DAYS = 30;
   const PAYABLES_RETENTION_DAYS = 350;
+  const DELETED_IDS_RETENTION_DAYS = 90;
+  const DELETED_IDS_HARD_LIMIT = 800;
+  const CASH_OPEN_ALERT_HOURS = 24;
   const CASH_HTML_REPORTS_LIMIT = 120;
   const INTERNAL_CASH_AUDIT_LIMIT = 120;
   const FINANCE_CYCLE_DAYS = 30;
@@ -61,21 +66,24 @@
     "Cortesia",
     "Sem ocorrencia"
   ];
-  // Configure these four values with the credentials of Cliente 2 before publishing.
-  const SUPABASE_URL = "https://wgresekhrdwlxlmftuvs.supabase.co";
-  const SUPABASE_ANON_KEY =
+  // Projeto operacional atual. Somente chaves publicas ficam no navegador.
+  const SUPABASE_URL = "https://avocfpretwjxrtfwlsqd.supabase.co";
+  const LEGACY_SUPABASE_ANON_KEY =
     "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6IndncmVzZWtocmR3bHhsbWZ0dXZzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTAwMjY1NzEsImV4cCI6MjEwNTYwMjU3MX0.NHqDFKe0nH6UjzcTtGZFBNEe_U55EUTkTcs_LQH_yGM";
-  const SUPABASE_PUBLISHABLE_KEY = "sb_publishable_JyK0dnU4FajLisbaxZ7Y_w_ovbBnWv2";
-  const SUPABASE_PROJECT_ID = "wgresekhrdwlxlmftuvs";
+  const SUPABASE_ANON_KEY = "sb_publishable_uVU6bLI0r8mHnZwWeIkxlA_mRFZCarZ";
+  const SUPABASE_PUBLISHABLE_KEY = "sb_publishable_uVU6bLI0r8mHnZwWeIkxlA_mRFZCarZ";
+  const SUPABASE_PROJECT_ID = "avocfpretwjxrtfwlsqd";
   const DEV_ACCESS_LOGIN = "dev";
   const DEV_ACCESS_PASSWORD = "dev";
   const DEV_SESSION_ID = "__dev__";
-  const DEVICE_PRESENCE_TTL_MS = 45 * 1000;
-  const DEVICE_PRESENCE_PING_MS = 10 * 1000;
-  const CLOUD_SYNC_DEBOUNCE_MS = 250;
-  const CLOUD_PULL_DEBOUNCE_MS = 400;
-  const CLOUD_REMOTE_PULL_DEBOUNCE_MS = 120;
-  const CLOUD_POLL_INTERVAL_MS = 2 * 1000;
+  const DEVICE_PRESENCE_TTL_MS = 3 * 60 * 1000;
+  const DEVICE_PRESENCE_PING_MS = 60 * 1000;
+  const CLOUD_SYNC_DEBOUNCE_MS = 400;
+  const CLOUD_PULL_DEBOUNCE_MS = 750;
+  const CLOUD_REMOTE_PULL_DEBOUNCE_MS = 750;
+  // Consultar a nuvem a cada minuto reduz drasticamente o tráfego. As
+  // atualizações em tempo real continuam chegando pelo canal Realtime.
+  const CLOUD_POLL_INTERVAL_MS = 60 * 1000;
   const ROLE_ACCESS_CODE_BY_ROLE = Object.freeze({
     admin: "1111",
     waiter: "2222"
@@ -144,6 +152,7 @@
     passwordDraft: "",
     quickSalePaidConfirm: true,
     printerPrefs: loadPrinterPrefs(),
+    printerDiscovery: [],
     qzSecurityConfigured: false,
     initialCloudLoadComplete: false,
     backupsList: null,
@@ -2552,6 +2561,42 @@
     });
   }
 
+  // Poda de IDs deletados baseada em tempo. IDs com mais de
+  // DELETED_IDS_RETENTION_DAYS sao removidos para evitar crescimento
+  // indefinido da lista (observado em producao: 127+ IDs acumulados).
+  // IDs de comandas contem timestamp codificado no formato base36 que
+  // permite estimar a idade. IDs sem timestamp legivel sao mantidos
+  // ate que o limite rigido (DELETED_IDS_HARD_LIMIT) force a poda FIFO.
+  function pruneDeletedIdsByTime(state) {
+    if (!state?.meta) return;
+    const threshold = Date.now() - DELETED_IDS_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+    const metaKeys = ["deletedComandaIds", "deletedUserIds", "deletedProductIds"];
+    for (const key of metaKeys) {
+      const list = normalizeDeletedIdList(state.meta[key]);
+      if (!list.length) continue;
+      // Tenta extrair timestamp de IDs que contem marcacao temporal.
+      // Formato tipico: CMD-0001-SESSxxxxYYYY ou PG-uuid
+      // Quando nao e possivel inferir a idade, mantemos o ID.
+      const pruned = list.filter((id) => {
+        // IDs numericos puros (user/product) nao carregam timestamp;
+        // mantidos ate o hard limit.
+        if (/^\d+$/.test(id)) return true;
+        // Tenta extrair o chunk base36 de tempo do ID de comanda
+        const match = /CMD-\d+-[A-Z0-9]{4}([A-Z0-9]{4})/i.exec(id);
+        if (match) {
+          const timeChunk = parseInt(match[1], 36);
+          // O chunk e os ultimos 4 caracteres de Date.now().toString(36)
+          // que cicla a cada ~60 dias. Sem data absoluta confiavel,
+          // confiamos no hard limit.
+          void timeChunk;
+        }
+        return true;
+      });
+      // Aplica limite rigido mantendo os mais recentes (final da lista)
+      state.meta[key] = pruned.slice(-DELETED_IDS_HARD_LIMIT);
+    }
+  }
+
   function normalizeCashHtmlReportRecord(entry, fallbackId = 0) {
     const parsed = entry && typeof entry === "object" ? entry : {};
     const createdAt = typeof parsed.createdAt === "string" && parsed.createdAt ? parsed.createdAt : isoNow();
@@ -2844,7 +2889,7 @@
 
     const originalPayables = targetState.payables;
     targetState.payables = originalPayables.filter(
-      (entry) => allComandaIds.has(String(entry?.comandaId || "")) && !hasSystemTestMarker(entry?.customerName)
+      (entry) => !hasSystemTestMarker(entry?.customerName)
     );
     if (targetState.payables.length !== originalPayables.length) changed = true;
 
@@ -3214,7 +3259,7 @@
     recomputeComandaSequence(recovered);
     ensureCatalogBackup(recovered, "normalize");
     pruneHistory(recovered);
-    prunePayables(recovered);
+    prunePayables(recovered);\r\n    pruneDeletedIdsByTime(recovered);
     pruneCashHtmlReports(recovered);
     pruneInternalCashAudits(recovered);
     pruneFinanceCycleReports(recovered);
@@ -3412,6 +3457,7 @@
     archiveFingerprints: new Map(),
     archiveRows: [],
     archiveSignature: "",
+    archiveHydrated: false,
     cloudFailureCount: 0,
     nextCloudAttemptAt: 0,
     pendingStateChangeBroadcast: null,
@@ -3768,40 +3814,37 @@
     switch (event) {
       case "state_changed":
         rememberObservedRemoteUpdatedAt(payload.updatedAt);
-        void pullStateFromSupabase();
+        // Mudancas operacionais chegam nos eventos especificos abaixo. O
+        // polling/reconexao reconcilia o estado completo sem baixar o JSON
+        // inteiro a cada alteracao feita por outro aparelho.
         break;
       case "cash_closed":
         if (applyCashClosed(payload)) requestBackgroundRender();
         rememberObservedRemoteUpdatedAt(payload.updatedAt);
-        void pullStateFromSupabase();
         break;
       case "kitchen_order_upsert":
         if (applyKitchenOrderUpsert(payload)) {
           requestBackgroundRender();
         }
         rememberObservedRemoteUpdatedAt(payload.updatedAt);
-        debouncedRemotePullFromSupabase();
         break;
       case "comanda_upsert":
         if (applyComandaUpsert(payload)) {
           requestBackgroundRender();
         }
         rememberObservedRemoteUpdatedAt(payload.updatedAt);
-        debouncedRemotePullFromSupabase();
         break;
       case "comanda_closed":
         if (applyComandaClosed(payload)) {
           requestBackgroundRender();
         }
         rememberObservedRemoteUpdatedAt(payload.updatedAt);
-        debouncedRemotePullFromSupabase();
         break;
       case "comanda_deleted":
         if (applyComandaDeleted(payload)) {
           requestBackgroundRender();
         }
         rememberObservedRemoteUpdatedAt(payload.updatedAt);
-        debouncedRemotePullFromSupabase();
         break;
       case "presence_ping":
         upsertDevicePresence(payload);
@@ -3962,6 +4005,7 @@
     state.session = { userId: null };
     pruneHistory(state);
     prunePayables(state);
+    pruneDeletedIdsByTime(state);
     pruneCashHtmlReports(state);
     pruneInternalCashAudits(state);
     pruneFinanceCycleReports(state);
@@ -4019,7 +4063,25 @@
     supabaseCtx.archiveFingerprints = new Map(rows.map((row) => [String(row.id), hashText(stableSerializeForHash(row.payload || {}))]));
     supabaseCtx.archiveRows = rows;
     supabaseCtx.archiveSignature = hashText(rows.map((row) => String(row.id)).sort().join("|"));
+    supabaseCtx.archiveHydrated = true;
     return rows;
+  }
+
+  async function hydrateCloudArchivesOnDemand() {
+    if (supabaseCtx.archiveHydrated) return true;
+    const client = getSupabaseClient();
+    if (!client) return false;
+    try {
+      const rows = await loadCloudArchiveRows(client);
+      const hydrated = assembleCloudState(state, rows);
+      adoptIncomingState(hydrated);
+      saveState({ skipCloud: true, touchMeta: false });
+      requestBackgroundRender();
+      return true;
+    } catch (err) {
+      console.warn("[archives] Falha ao carregar historico sob demanda:", err);
+      return false;
+    }
   }
 
   async function persistCloudArchiveRows(client, archiveRows) {
@@ -4324,11 +4386,10 @@
   }
 
   function startAutoBackupInterval() {
-    if (supabaseCtx.backupInterval) return;
-    supabaseCtx.backupInterval = setInterval(() => {
-      void pushBackupToSupabase("auto-6h");
-    }, BACKUP_AUTO_INTERVAL_MS);
-    console.log("[backup] Backup automatico agendado a cada 6h.");
+    // Um navegador por aparelho criava snapshots completos duplicados. Os
+    // backups continuam disponiveis no fechamento do caixa e manualmente;
+    // este app nao cria mais backups periodicos em todos os dispositivos.
+    return;
   }
 
   async function pullStateFromSupabase() {
@@ -4346,9 +4407,11 @@
       const mainResult = await client.from("restobar_state").select("payload,updated_at").eq("id", "main").maybeSingle();
       const { data: mainData, error } = mainResult;
       const remoteArchiveSignature = String(mainData?.payload?.meta?.cloudArchiveSignature || "");
-      const shouldReloadArchives =
-        !supabaseCtx.archiveRows.length ||
-        !remoteArchiveSignature ||
+      // Historico e relatorios podem ter varios MB. Eles so sao carregados
+      // quando a tela que os utiliza pede explicitamente, nunca no boot ou a
+      // cada mudanca operacional de comanda.
+      const shouldReloadArchives = supabaseCtx.archiveHydrated &&
+        Boolean(remoteArchiveSignature) &&
         remoteArchiveSignature !== supabaseCtx.archiveSignature;
       const archiveRows = shouldReloadArchives ? await loadCloudArchiveRows(client) : supabaseCtx.archiveRows;
       const data = mainData?.payload
@@ -4606,22 +4669,7 @@
       .on("broadcast", { event: "kitchen_order_upsert" }, (m) => handleIncomingRealtimeMessage("kitchen_order_upsert", m?.payload))
       .on("broadcast", { event: "comanda_upsert" }, (m) => handleIncomingRealtimeMessage("comanda_upsert", m?.payload))
       .on("broadcast", { event: "comanda_closed" }, (m) => handleIncomingRealtimeMessage("comanda_closed", m?.payload))
-      .on("broadcast", { event: "comanda_deleted" }, (m) => handleIncomingRealtimeMessage("comanda_deleted", m?.payload))
-      .on(
-        "postgres_changes",
-        {
-          event: "*",
-          schema: "public",
-          table: "restobar_state",
-          filter: "id=eq.main"
-        },
-        (payload) => {
-          if (payload?.new?.updated_at) {
-            rememberObservedRemoteUpdatedAt(payload.new.updated_at);
-            debouncedRemotePullFromSupabase();
-          }
-        }
-      );
+      .on("broadcast", { event: "comanda_deleted" }, (m) => handleIncomingRealtimeMessage("comanda_deleted", m?.payload));
 
     channel.subscribe((status) => {
       if (status === "SUBSCRIBED") {
@@ -5468,12 +5516,40 @@
       </div>
     `;
   }
+  function cashOpenAgeHours() {
+    const openedAt = parseUpdatedAtTimestamp(state.cash?.openedAt);
+    if (!openedAt) return 0;
+    return Math.max(0, (Date.now() - openedAt) / (60 * 60 * 1000));
+  }
+
+  function renderCashOpenAlert() {
+    const hours = cashOpenAgeHours();
+    if (hours < CASH_OPEN_ALERT_HOURS) return "";
+    const days = Math.floor(hours / 24);
+    const remainingHours = Math.floor(hours % 24);
+    const timeLabel = days > 0
+      ? `${days} dia(s) e ${remainingHours}h`
+      : `${Math.floor(hours)}h`;
+    return `
+      <div class="card" style="border-left:4px solid #e74c3c;background:#fff5f5;margin-bottom:0.75rem;padding:0.75rem 1rem;">
+        <div style="display:flex;align-items:center;gap:0.5rem;">
+          <span style="font-size:1.4rem;">⚠️</span>
+          <div>
+            <b style="color:#c0392b;">Caixa aberto ha ${esc(timeLabel)}</b>
+            <p style="margin:0.25rem 0 0;font-size:0.85rem;color:#666;">O caixa esta aberto desde ${formatCashOpenedAtLabel(state.cash?.openedAt)}. Recomendamos fechar o caixa diariamente para manter o historico organizado e o desempenho do sistema.</p>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
   function renderAdminDashboard() {
     const open = state.openComandas.length;
     const closed = state.closedComandas.length;
     const grossToday = state.closedComandas.reduce((sum, c) => sum + comandaTotal(c), 0);
 
     return `
+      ${renderCashOpenAlert()}
       <div class="grid">
         <div class="kpis">
           <div class="kpi"><p>Comandas Abertas</p><b>${open}</b></div>
@@ -6530,7 +6606,7 @@
         await printReceiptViaQz(html, closure.id || reportId);
         return;
       } catch (err) {
-        alert(`Nao foi possivel imprimir o historico: ${String(err?.message || err)}\n\nConfira a MTP-II e o QZ Tray nesta maquina.`);
+        alert(`Nao foi possivel imprimir o historico: ${String(err?.message || err)}\n\nConfira o QZ Tray e a impressora selecionada.`);
         return;
       }
     }
@@ -7483,20 +7559,24 @@
 
   function renderAdminPrinting() {
     const prefs = normalizePrinterPrefs(uiState.printerPrefs);
-    const configuredName = prefs.receiptPrinterName || "Impressora padrao do Windows";
-    const kitchenPrinterName = prefs.kitchenPrinterName || "Impressora padrao do Windows";
+    const printerOptions = (uiState.printerDiscovery || []).map((name) => `<option value="${esc(name)}"></option>`).join("");
     return `
       <div class="grid cols-2">
         <section class="card">
-          <h3>Impressora de cupom</h3>
-          <p class="note">Use nesta maquina que esta pareada por Bluetooth com a MTP-II. O QZ Tray envia o cupom para a fila do Windows sem abrir a janela de impressao.</p>
+          <h3>MTP-II 58 mm</h3>
+          <p class="note">Para imprimir automaticamente, o QZ Tray precisa estar aberto. Clique em “Buscar impressoras” e selecione uma das impressoras detectadas.</p>
+          <div class="actions" style="margin:0.75rem 0;">
+            <button class="btn primary" type="button" data-action="detect-printers">Buscar impressoras</button>
+            <button class="btn secondary" type="button" data-action="setup-mtp-printer">Selecionar POS-58 automaticamente</button>
+          </div>
+          <p class="note">Se houver duas impressoras, ambas aparecem nos campos abaixo. Escolha a desejada para cupom e/ou cozinha.</p>
+          <h3 style="margin-top:1rem;">Impressora de cupom</h3>
           <div class="field" style="margin-top:0.75rem;">
             <label><input type="checkbox" data-role="receipt-direct-enabled" ${prefs.receiptDirectEnabled ? "checked" : ""} /> Imprimir cupom automaticamente ao finalizar venda</label>
           </div>
           <div class="field">
-            <label>Nome da impressora neste dispositivo</label>
-            <input data-role="receipt-printer-name" value="${esc(prefs.receiptPrinterName)}" placeholder="Ex.: MTP-II" />
-            <p class="note">Deixe vazio para usar a impressora padrao desta maquina.</p>
+            <label>Impressora para cupom</label>
+            <input data-role="receipt-printer-name" list="detected-printers" value="${esc(prefs.receiptPrinterName)}" placeholder="Ex.: POS-58" />
           </div>
           <div class="field">
             <label>Largura do papel</label>
@@ -7517,19 +7597,18 @@
             <label><input type="checkbox" data-role="kitchen-direct-enabled" ${prefs.kitchenDirectEnabled ? "checked" : ""} /> Imprimir pedidos automaticamente ao enviar</label>
           </div>
           <div class="field">
-            <label>Nome da impressora da cozinha neste dispositivo</label>
-            <input data-role="kitchen-printer-name" value="${esc(prefs.kitchenPrinterName)}" placeholder="Ex.: MTP-II Cozinha" />
-            <p class="note">Deixe vazio para usar a impressora padrao do Windows.</p>
+            <label>Impressora da cozinha</label>
+            <input data-role="kitchen-printer-name" list="detected-printers" value="${esc(prefs.kitchenPrinterName)}" placeholder="Ex.: POS-58" />
           </div>
           <div class="actions">
             <button class="btn primary" type="button" data-action="save-kitchen-printer-config">Salvar configuracao</button>
           </div>
-          <p class="note" style="margin-top:0.75rem;">Destino atual: <b>${esc(kitchenPrinterName)}</b>. O QZ Tray precisa estar aberto nesta maquina.</p>
+          <p class="note" style="margin-top:0.75rem;">A escolha é salva neste computador e os pedidos saem sem janela de impressão.</p>
         </section>
+        <datalist id="detected-printers">${printerOptions}</datalist>
         <section class="card">
           <h3>Status e emissao fiscal</h3>
-          <p class="note">Destino do cupom do cliente: <b>${esc(configuredName)}</b>.</p>
-          <p class="note">O cupom termico e impresso somente nesta maquina. Pedidos dos demais celulares sincronizam pelo Supabase, mas nao tentam usar o Bluetooth deles.</p>
+          <p class="note">O cupom será enviado diretamente à impressora selecionada.</p>
           <p class="note">A MTP-II imprime o DANFE depois que a NFC-e for autorizada. A integracao com SEFAZ/provedor permanece bloqueada ate cadastrar UF, certificado e credenciais; o sistema nao apresenta cupom comum como documento fiscal.</p>
           <p class="note">Antes do primeiro uso: pareie a MTP-II neste dispositivo, instale a ponte de impressao compativel, defina o nome acima e deixe-a aberta.</p>
         </section>
@@ -12600,72 +12679,87 @@
     if (qzLibraryLoadPromise) return qzLibraryLoadPromise;
     qzLibraryLoadPromise = new Promise((resolve, reject) => {
       const script = document.createElement("script");
-      script.src = "https://cdn.jsdelivr.net/npm/qz-tray@2.2.4/qz-tray.js";
+      script.src = "https://cdn.jsdelivr.net/npm/qz-tray@2.3.0/qz-tray.js";
       script.async = true;
-      script.dataset.role = "qz-tray-library";
-      script.addEventListener("load", () => resolve(), { once: true });
-      script.addEventListener("error", () => reject(new Error("Falha ao carregar a biblioteca QZ Tray.")), { once: true });
+      script.addEventListener("load", resolve, { once: true });
+      script.addEventListener("error", () => reject(new Error("A biblioteca QZ Tray foi bloqueada pelo navegador.")), { once: true });
       document.head.appendChild(script);
-    }).catch((error) => {
-      qzLibraryLoadPromise = null;
-      throw error;
     });
     return qzLibraryLoadPromise;
   }
 
-  function ensureQzSecurityConfig() {
-    if (!qzLibraryAvailable() || uiState.qzSecurityConfigured) return;
-    try {
-      // Modo simples para ambiente local. Em producao o ideal e assinatura valida.
+  async function ensureQzConnected() {
+    await loadQzLibrary();
+    if (!qzLibraryAvailable()) throw new Error("QZ Tray não foi carregado.");
+    if (!uiState.qzSecurityConfigured) {
       window.qz.security.setCertificatePromise((resolve) => resolve());
       window.qz.security.setSignaturePromise(() => (resolve) => resolve());
       uiState.qzSecurityConfigured = true;
-    } catch (_err) { }
-  }
-
-  async function ensureQzConnected() {
-    await loadQzLibrary();
-    if (!qzLibraryAvailable()) {
-      throw new Error("QZ Tray nao detectado no navegador.");
     }
-    ensureQzSecurityConfig();
-    if (window.qz.websocket.isActive()) return;
-    await window.qz.websocket.connect({ retries: 2, delay: 1 });
+    if (!window.qz.websocket.isActive()) {
+      // O QZ Tray desta instalação expõe o WebSocket seguro em localhost:8181.
+      // Fixar host/porta evita tentativas em hosts alternativos que alguns
+      // navegadores ou políticas locais bloqueiam.
+      await window.qz.websocket.connect({
+        host: "localhost",
+        port: { secure: [8181], insecure: [] },
+        usingSecure: true,
+        retries: 1,
+        delay: 1
+      });
+    }
   }
 
-  async function resolvePrinterName(preferredName = "") {
-    const preferred = String(preferredName || "").trim();
-    if (preferred) return preferred;
-    return (await window.qz.printers.getDefault()) || "";
+  async function findWindowsPrinters() {
+    await ensureQzConnected();
+    const found = await window.qz.printers.find();
+    uiState.printerDiscovery = [...new Set((Array.isArray(found) ? found : [found]).map((value) => String(value || "").trim()).filter(Boolean))];
+    return uiState.printerDiscovery;
+  }
+
+  async function detectPrintersFromUi() {
+    try {
+      const printers = await findWindowsPrinters();
+      render();
+      alert(printers.length ? `Impressoras encontradas: ${printers.join(", ")}` : "Nenhuma impressora encontrada no Windows.");
+    } catch (err) {
+      alert(`Não foi possível conectar ao QZ Tray: ${String(err?.message || err)}\n\nSe aparecer “Connection blocked by client”, desative o bloqueador de anúncios/extensão para este site e libere a conexão com localhost.`);
+    }
+  }
+
+  async function setupMtpPrinterFromUi() {
+    const actor = currentActor();
+    if (!isAdminOrDev(actor)) {
+      alert("Somente administrador pode configurar a impressora.");
+      return;
+    }
+    try {
+      const printers = await findWindowsPrinters();
+      const selected = printers.find((name) => /pos[- ]?58|mtp|58\s*mm/i.test(name));
+      if (!selected) throw new Error("POS-58 não foi encontrada. Clique em Buscar impressoras e escolha um nome da lista.");
+      uiState.printerPrefs = normalizePrinterPrefs({ ...uiState.printerPrefs, receiptDirectEnabled: true, receiptPrinterName: selected, kitchenDirectEnabled: true, kitchenPrinterName: selected, receiptPaperWidthMm: 58 });
+      persistPrinterPrefs();
+      render();
+      alert(`Impressão automática ativada para ${selected}.`);
+    } catch (err) {
+      alert(`Não foi possível configurar: ${String(err?.message || err)}\n\nSe a mensagem for “Connection blocked by client”, libere o QZ Tray no bloqueador/extensão do navegador.`);
+    }
   }
 
   async function printHtmlViaQz(html, options = {}) {
     await ensureQzConnected();
-    const printerName = await resolvePrinterName(options.printerName);
-    if (!printerName) {
-      throw new Error("Nenhuma impressora configurada ou definida como padrao no Windows.");
-    }
-    const config = window.qz.configs.create(printerName, {
-      copies: 1,
-      jobName: String(options.jobName || "cupom"),
-      colorType: "blackwhite"
-    });
-    const data = [{ type: "pixel", format: "html", flavor: "plain", data: html }];
-    await window.qz.print(config, data);
+    const printerName = String(options.printerName || "").trim() || await window.qz.printers.getDefault();
+    if (!printerName) throw new Error("Selecione uma impressora em Impressão.");
+    const config = window.qz.configs.create(printerName, { copies: 1, jobName: String(options.jobName || "cupom"), colorType: "blackwhite" });
+    await window.qz.print(config, [{ type: "pixel", format: "html", flavor: "plain", data: html }]);
   }
 
   async function printKitchenTicketViaQz(html, comandaId = "") {
-    return printHtmlViaQz(html, {
-      printerName: uiState.printerPrefs?.kitchenPrinterName,
-      jobName: `cozinha-${String(comandaId || "pedido")}`
-    });
+    return printHtmlViaQz(html, { printerName: uiState.printerPrefs?.kitchenPrinterName, jobName: `cozinha-${String(comandaId || "pedido")}` });
   }
 
   async function printReceiptViaQz(html, receiptId = "") {
-    return printHtmlViaQz(html, {
-      printerName: uiState.printerPrefs?.receiptPrinterName,
-      jobName: `cupom-${String(receiptId || "venda")}`
-    });
+    return printHtmlViaQz(html, { printerName: uiState.printerPrefs?.receiptPrinterName, jobName: `cupom-${String(receiptId || "venda")}` });
   }
 
   function setKitchenDirectPrintEnabled(enabled) {
@@ -12731,7 +12825,7 @@
       await printReceiptViaQz(buildReceiptTestHtml(), "teste");
       alert("Teste enviado para a impressora.");
     } catch (err) {
-      alert(`Nao foi possivel imprimir o teste: ${String(err?.message || err)}\n\nConfira se a MTP-II esta pareada, configurada no Windows e se o QZ Tray esta aberto.`);
+      alert(`Nao foi possivel imprimir o teste: ${String(err?.message || err)}\n\nConfira o QZ Tray e a impressora selecionada. Se aparecer “Connection blocked by client”, libere o QZ no bloqueador/extensão do navegador.`);
     }
   }
 
@@ -13171,7 +13265,7 @@
           await printReceiptViaQz(html, comanda.id);
         }
       } catch (err) {
-        const message = `Falha ao imprimir o pedido: ${String(err?.message || err)}\n\nConfira a MTP-II e o QZ Tray nesta maquina.`;
+        const message = `Falha ao imprimir o pedido: ${String(err?.message || err)}\n\nConfira o QZ Tray e a impressora selecionada.`;
         if (!options.silent) alert(message);
         else console.warn(message);
         return false;
@@ -13408,6 +13502,16 @@
       if (action === "set-tab") {
         const role = button.dataset.role;
         const tab = button.dataset.tab;
+        // Financeiro e fiados precisam refletir o banco imediatamente ao
+        // abrir a tela, inclusive em aparelhos que acabaram de atualizar a
+        // PWA ou ficaram algum tempo sem conexao.
+        if (tab === "financeiro" && (role === "admin" || role === "dev")) {
+          supabaseCtx.nextCloudAttemptAt = 0;
+          await pullStateFromSupabase();
+        }
+        if (tab === "historico") {
+          await hydrateCloudArchivesOnDemand();
+        }
         if (role === "admin") uiState.adminTab = tab;
         if (role === "dev") uiState.devTab = tab;
         if (role === "waiter") uiState.waiterTab = tab;
@@ -13589,6 +13693,16 @@
 
       if (action === "save-kitchen-printer-config") {
         saveKitchenPrinterConfigFromUi();
+        return;
+      }
+
+      if (action === "setup-mtp-printer") {
+        await setupMtpPrinterFromUi();
+        return;
+      }
+
+      if (action === "detect-printers") {
+        await detectPrintersFromUi();
         return;
       }
 

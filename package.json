@@ -8,6 +8,7 @@
     "build": "node scripts/build-static.js",
     "test:stability": "node scripts/test-stability.js",
     "test:stress": "node scripts/simulate-10-devices.js",
+    "test:concurrency": "node scripts/full-concurrency-offline-test.js",
     "seed:test-comandas": "node scripts/create-test-comandas.js",
     "seed:products": "node scripts/seed-products.js"
   },
