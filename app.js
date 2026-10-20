@@ -961,6 +961,7 @@
     if (!item) return 0;
     return Math.max(
       parseUpdatedAtTimestamp(item.updatedAt),
+      parseUpdatedAtTimestamp(item.lastIncrementAt),
       parseUpdatedAtTimestamp(item.addedAt),
       parseUpdatedAtTimestamp(item.kitchenStatusAt),
       parseUpdatedAtTimestamp(item.kitchenPriorityAt),
@@ -989,7 +990,14 @@
       if (!allowRemoteOnly && !map.has(id)) continue;
       const previous = map.get(id);
       const merged = pickRowByTimestamp(previous, comanda, {
-        getTimestamp: (row) => row?.updatedAt || (Array.isArray(row?.events) && row.events.length ? row.events[row.events.length - 1]?.ts : null) || row?.closedAt || row?.createdAt || "",
+        getTimestamp: (row) => {
+          const rowTs = parseUpdatedAtTimestamp(row?.updatedAt || 0);
+          const lastEventTs = Array.isArray(row?.events) && row.events.length
+            ? parseUpdatedAtTimestamp(row.events[row.events.length - 1]?.ts || 0)
+            : 0;
+          const otherTs = parseUpdatedAtTimestamp(row?.closedAt || row?.createdAt || 0);
+          return Math.max(rowTs, lastEventTs, otherTs);
+        },
         preferLocal: options.preferLocal !== false
       });
       // Item-level merge: preserva itens de ambos os lados para evitar sumico
@@ -1006,7 +1014,9 @@
             const existing = itemMap.get(itemId);
             const existingTs = latestKitchenItemTimestamp(existing);
             const incomingTs = latestKitchenItemTimestamp(item);
-            if (incomingTs > existingTs) itemMap.set(itemId, item);
+            if (incomingTs > existingTs || (incomingTs === existingTs && Number(item.qty || 0) > Number(existing.qty || 0))) {
+              itemMap.set(itemId, item);
+            }
           }
           merged.items = [...itemMap.values()];
         }
@@ -4869,9 +4879,10 @@
 
   function appendComandaEvent(comanda, { actor, type, detail, reason = "", itemId = null }) {
     const normalized = normalizeAdminComandaEvent(actor, type, detail);
+    const now = isoNow();
     comanda.events = comanda.events || [];
     comanda.events.push({
-      ts: isoNow(),
+      ts: now,
       actorId: actor.id,
       actorRole: actor.role,
       actorName: actor.name,
@@ -4880,6 +4891,7 @@
       reason,
       itemId
     });
+    comanda.updatedAt = now;
     appendAudit({ actor, type: normalized.type, detail: normalized.detail, comandaId: comanda.id, itemId, reason });
     supabaseCtx.prioritizeNextCloudSync = true;
   }
@@ -11541,12 +11553,15 @@
       return;
     }
 
+    const now = isoNow();
     product.stock -= delta;
-    product.updatedAt = isoNow();
+    product.updatedAt = now;
     item.qty = parseNumber(item.qty || 0) + delta;
-    item.lastIncrementAt = isoNow();
+    item.lastIncrementAt = now;
+    item.updatedAt = now;
     item.waiterVisualState = "new";
-    item.waiterVisualUpdatedAt = isoNow();
+    item.waiterVisualUpdatedAt = now;
+    comanda.updatedAt = now;
 
     appendComandaEvent(comanda, {
       actor,
@@ -11556,6 +11571,10 @@
     });
 
     saveState();
+    publishComandaUpsert(comanda, [item], actor, "Item incrementado");
+    if (itemNeedsKitchen(item)) {
+      publishKitchenOrderUpsert(comanda, [item], actor, "Item incrementado");
+    }
     if (AUTO_OPEN_KITCHEN_PREVIEW_ON_ADD && itemNeedsKitchen(item) && !item.delivered && !item.canceled) {
       const extraItem = {
         ...item,
@@ -11773,14 +11792,17 @@
       product.updatedAt = isoNow();
     }
 
+    const now = isoNow();
     if (qtyToCancel >= currentQty) {
       item.canceled = true;
-      item.canceledAt = isoNow();
+      item.canceledAt = now;
+      item.updatedAt = now;
       item.cancelReason = reason;
       item.cancelNote = note;
       item.kitchenAlertUnread = false;
       item.waiterVisualState = "";
-      item.waiterVisualUpdatedAt = isoNow();
+      item.waiterVisualUpdatedAt = now;
+      comanda.updatedAt = now;
       appendComandaEvent(comanda, {
         actor,
         type: "item_cancelado",
@@ -11790,9 +11812,11 @@
       });
     } else {
       item.qty = currentQty - qtyToCancel;
-      item.lastIncrementAt = isoNow();
+      item.lastIncrementAt = now;
+      item.updatedAt = now;
       item.waiterVisualState = "";
-      item.waiterVisualUpdatedAt = isoNow();
+      item.waiterVisualUpdatedAt = now;
+      comanda.updatedAt = now;
       appendComandaEvent(comanda, {
         actor,
         type: "item_reduzido",
