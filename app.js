@@ -306,6 +306,12 @@
   function sanitizeOperationalComandasAgainstHistory(targetState) {
     if (!targetState || typeof targetState !== "object") return;
     targetState.history90 = sanitizeHistoryClosuresByCashWindow(targetState.history90);
+    const cashClosedTs = parseUpdatedAtTimestamp(targetState.meta?.cashClosedAt);
+    const isFromClosedCash = (comanda) => {
+      if (!cashClosedTs) return false;
+      const refTs = comandaReferenceTimestamp(comanda);
+      return Boolean(refTs && refTs <= cashClosedTs);
+    };
     const archivedIds = new Set(
       (targetState.history90 || [])
         .flatMap((closure) => (Array.isArray(closure?.commandas) ? closure.commandas : []))
@@ -313,18 +319,20 @@
         .filter(Boolean)
     );
     const closedComandas = dedupeComandasById(targetState.closedComandas).filter(
-      (comanda) => !archivedIds.has(String(comanda?.id || "").trim())
+      (comanda) => {
+        const id = String(comanda?.id || "").trim();
+        if (!id || archivedIds.has(id)) return false;
+        if (isFromClosedCash(comanda)) return false;
+        return true;
+      }
     );
     const closedIds = new Set(closedComandas.map((comanda) => String(comanda?.id || "").trim()).filter(Boolean));
     const openComandas = dedupeComandasById(targetState.openComandas).filter((comanda) => {
       const id = String(comanda?.id || "").trim();
-      if (!id) {
+      if (!id || archivedIds.has(id) || closedIds.has(id)) {
         return false;
       }
-      if (archivedIds.has(id)) {
-        return false;
-      }
-      if (closedIds.has(id)) {
+      if (isFromClosedCash(comanda)) {
         return false;
       }
       return true;
@@ -1251,18 +1259,30 @@
     // ser descartados apenas porque a copia local esta mais recente no "meta.updatedAt".
     // Em cenarios concorrentes, manter "remote-only" evita sumico temporario de pedidos.
     const allowRemoteOperationalInsert = true;
+    const cashClosedTs = parseUpdatedAtTimestamp(cashClosedAt);
+    const isComandaFromClosedCash = (comanda) => {
+      if (!cashClosedTs) return false;
+      const refTs = comandaReferenceTimestamp(comanda);
+      return Boolean(refTs && refTs <= cashClosedTs);
+    };
     const mergedOpenComandasRaw = mergeComandasById(localState?.openComandas, remoteState?.openComandas, {
       preferLocal,
       allowRemoteOnly: allowRemoteOperationalInsert,
       deletedIds: deletedComandaIds
     });
-    const mergedClosedComandas = mergeComandasById(localState?.closedComandas, remoteState?.closedComandas, {
+    const mergedClosedComandasRaw = mergeComandasById(localState?.closedComandas, remoteState?.closedComandas, {
       preferLocal,
       allowRemoteOnly: allowRemoteOperationalInsert,
       deletedIds: deletedComandaIds
     });
+    const mergedClosedComandas = mergedClosedComandasRaw.filter((comanda) => !isComandaFromClosedCash(comanda));
     const closedIds = new Set(mergedClosedComandas.map((comanda) => String(comanda?.id || "").trim()).filter(Boolean));
-    const mergedOpenComandas = mergedOpenComandasRaw.filter((comanda) => !closedIds.has(String(comanda?.id || "").trim()));
+    const mergedOpenComandas = mergedOpenComandasRaw.filter((comanda) => {
+      const id = String(comanda?.id || "").trim();
+      if (!id || closedIds.has(id)) return false;
+      if (isComandaFromClosedCash(comanda)) return false;
+      return true;
+    });
     const mergedHistory90 = mergeRowsByIdWithTimestamp(localState?.history90, remoteState?.history90, {
       getTimestamp: (row) => row?.closedAt || row?.createdAt || row?.updatedAt || "",
       preferLocal,
@@ -1279,6 +1299,10 @@
       getTimestamp: (row) => row?.updatedAt || row?.deliveredAt || "",
       preferLocal,
       allowRemoteOnly: allowRemoteOperationalInsert
+    }).filter((row) => {
+      if (!cashClosedTs) return true;
+      const ts = parseUpdatedAtTimestamp(row?.updatedAt || row?.deliveredAt);
+      return !ts || ts > cashClosedTs;
     });
     const mergedPayables = mergePayablesWithTimestamp(localState?.payables, remoteState?.payables, {
       getTimestamp: (row) => row?.updatedAt || row?.paidAt || row?.createdAt || "",
